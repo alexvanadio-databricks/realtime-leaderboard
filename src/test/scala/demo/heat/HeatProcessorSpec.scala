@@ -19,15 +19,20 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
   // helpers to build HeatIn
   private def pulse(ts: Long, et: String, role: String, eid: Long) =
     HeatIn("GAME", "ORDER", "RIOT#ID", ts, "pulse", Some(et), None, Some(role),
-      None, None, Some(eid), None, None, None, None)
+      None, None, Some(eid), None, None, None, None, None)
 
   private def pulseNoEid(ts: Long, et: String, role: String) =
     HeatIn("GAME", "ORDER", "RIOT#ID", ts, "pulse", Some(et), None, Some(role),
-      None, None, None, None, None, None, None)
+      None, None, None, None, None, None, None, None)
 
   private def snapshot(ts: Long, level: Int, inv: Double, k: Int, d: Int, a: Int, cs: Double, champ: String) =
     HeatIn("GAME", "ORDER", "RIOT#ID", ts, "snapshot", None, Some(champ), None,
-      Some(level), Some(inv), None, Some(k), Some(d), Some(a), Some(cs))
+      Some(level), Some(inv), None, Some(k), Some(d), Some(a), Some(cs), None)
+
+  private def snapshotWithItems(ts: Long, level: Int, inv: Double, k: Int,
+                                d: Int, a: Int, cs: Double, champ: String, items: String) =
+    HeatIn("GAME", "ORDER", "RIOT#ID", ts, "snapshot", None, Some(champ), None,
+      Some(level), Some(inv), None, Some(k), Some(d), Some(a), Some(cs), Some(items))
 
   // No timers used by our code; pass null safely.
   private val NoTimers: TimerValues = null.asInstanceOf[TimerValues]
@@ -186,7 +191,7 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     val s = HeatIn("GAME", "ORDER", "RIOT#ID", 1_000L, "snapshot",
       etype = None, championName = None, role = None,
       level = None, invValue = None, eventId = None,
-      kills = Some(0), deaths = Some(0), assists = Some(0), creepScore = Some(0.0))
+      kills = Some(0), deaths = Some(0), assists = Some(0), creepScore = Some(0.0), None)
     val out = p.handleInputRows(testKey, Iterator(s), NoTimers).toList
     out shouldBe empty
   }
@@ -465,7 +470,7 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     val fb = HeatIn("GAME", "ORDER", "RIOT#ID", 10_000L, "pulse",
       etype = Some("FirstBlood"), championName = None, role = Some("killer"),
       level = None, invValue = None, eventId = Some(1L),
-      kills = None, deaths = None, assists = None, creepScore = None)
+      kills = None, deaths = None, assists = None, creepScore = None, items_str = None)
 
     val out = p.handleInputRows(testKey, Iterator(fb), NoTimers).toList
     out should have length 1
@@ -482,7 +487,7 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     val anchor = HeatIn("GAME", "ORDER", "RIOT#ID", 55_000L, "pulse",
       etype = Some("ChampionKill"), championName = None, role = None,
       level = None, invValue = None, eventId = Some(2L),
-      kills = None, deaths = None, assists = None, creepScore = None)
+      kills = None, deaths = None, assists = None, creepScore = None, items_str = None)
 
     val out = p.handleInputRows(testKey, Iterator(anchor), NoTimers).toList
     out should have length 1
@@ -626,5 +631,199 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     // constants surfaced by the processor should echo the companion’s values
     o.momentumCap shouldBe MomentumCap +- 1e-9
     o.halfLifeSec shouldBe HalfLifeSeconds +- 1e-9
+  }
+
+  test("first snapshot with items emits and sets items_str") {
+    val p = newProc()
+
+    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
+    val out = p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(1_000L, 1, 500.0, 0, 0, 0, 0.0, "Sivir", itemsA)
+    ), NoTimers).toList
+
+    out should have length 1
+    out.head.items_str shouldBe itemsA
+  }
+
+  test("identical items string on later snapshot does NOT emit") {
+    val p = newProc()
+    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
+
+    p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(1_000L, 2, 800.0, 0, 0, 0, 0.0, "Sivir", itemsA)
+    ), NoTimers).toList should have length (1)
+
+    // same items; no other deltas → no emit
+    val out = p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(2_000L, 2, 800.0, 0, 0, 0, 0.0, "Sivir", itemsA)
+    ), NoTimers).toList
+    out shouldBe empty
+  }
+
+  test("items-only change emits even when level/inv are unchanged") {
+    val p = newProc()
+    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
+    val itemsB = "0:100:Boots of Speed, 1:201:Sword of Justice" // slot 1 item changed
+
+    p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(1_000L, 6, 2000.0, 0, 0, 0, 0.0, "Lux", itemsA)
+    ), NoTimers).toList should have length (1)
+
+    val out = p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(2_000L, 6, 2000.0, 0, 0, 0, 0.0, "Lux", itemsB)
+    ), NoTimers).toList
+
+    out should have length 1
+    out.head.items_str shouldBe itemsB
+    out.head.level shouldBe 6
+    out.head.invValue shouldBe 2000.0 +- 1e-9
+  }
+
+  test("older-timestamp snapshot with different items does NOT override and does NOT emit") {
+    val p = newProc()
+    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
+    val itemsB = "0:100:Boots of Speed, 1:202:Hammer of Truth"
+
+    // First set items at t=2000
+    p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(2_000L, 5, 1500.0, 0, 0, 0, 0.0, "Sona", itemsA)
+    ), NoTimers).toList should have length (1)
+
+    // Then send an OLDER snapshot (t=1500) with different items → should be ignored (ts < lastTs)
+    val out = p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(1_500L, 5, 1500.0, 0, 0, 0, 0.0, "Sona", itemsB)
+    ), NoTimers).toList
+
+    out shouldBe empty
+
+    // Next pulse emission should still carry itemsA
+    val pulseOut = p.handleInputRows(testKey, Iterator(
+      pulse(3_000L, "ChampionKill", "assist", 1L)
+    ), NoTimers).toList
+    pulseOut should have length 1
+    pulseOut.head.items_str shouldBe itemsA
+  }
+
+  test("snapshot with items=None does not change items and does NOT emit when no other deltas") {
+    val p = newProc()
+    val itemsA = "0:100:Boots of Speed"
+
+    // Seed with items
+    p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(1_000L, 3, 900.0, 0, 0, 0, 0.0, "Ahri", itemsA)
+    ), NoTimers).toList should have length (1)
+
+    // Same state, items omitted
+    val sNoItems = snapshot(2_000L, 3, 900.0, 0, 0, 0, 0.0, "Ahri") // items=None via your existing helper
+    val out = p.handleInputRows(testKey, Iterator(sNoItems), NoTimers).toList
+    out shouldBe empty
+  }
+
+  test("items string with trailing spaces is trimmed; no emit when semantically equal") {
+    val p = newProc()
+    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
+
+    p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(1_000L, 4, 1200.0, 0, 0, 0, 0.0, "Jinx", itemsA)
+    ), NoTimers).toList should have length (1)
+
+    // Same items but with trailing spaces; processor trims before compare → no emit
+    val itemsWithSpaces = "0:100:Boots of Speed, 1:200:Sword of Might   "
+    val out = p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(2_000L, 4, 1200.0, 0, 0, 0, 0.0, "Jinx", itemsWithSpaces)
+    ), NoTimers).toList
+    out shouldBe empty
+  }
+
+  test("two snapshots in one micro-batch: later items win; single emission with final items") {
+    val p = newProc()
+    val itemsA = "0:100:Boots of Speed"
+    val itemsB = "0:100:Boots of Speed, 1:210:Dagger"
+
+    // Same batch; processor sorts by ts and emits once at the end
+    val out = p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(1_000L, 2, 600.0, 0, 0, 0, 0.0, "Lux", itemsA),
+      snapshotWithItems(2_000L, 2, 600.0, 0, 0, 0, 0.0, "Lux", itemsB)
+    ), NoTimers).toList
+
+    out should have length 1
+    out.head.items_str shouldBe itemsB
+  }
+
+  test("items change while inv decreases: items update emits; inv remains monotone (non-decreasing)") {
+    val p = newProc()
+    val itemsA = "0:100:Boots of Speed, 1:250:Staff"
+    val itemsB = "0:100:Boots of Speed, 1:260:Wand"
+
+    val s1 = p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(1_000L, 7, 2000.0, 0, 0, 0, 0.0, "Lux", itemsA)
+    ), NoTimers).toList
+    s1 should have length 1
+    s1.head.invValue shouldBe 2000.0 +- 1e-9
+
+    // Lower inv (1500) should NOT regress; items change should emit
+    val s2 = p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(2_000L, 7, 1500.0, 0, 0, 0, 0.0, "Lux", itemsB)
+    ), NoTimers).toList
+
+    s2 should have length 1
+    s2.head.items_str shouldBe itemsB
+    s2.head.invValue shouldBe 2000.0 +- 1e-9 // still the higher, due to monotone merge
+  }
+
+  test("pulse does not change items; emission carries last known items") {
+    val p = newProc()
+    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
+
+    p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(1_000L, 5, 1100.0, 0, 0, 0, 0.0, "Sivir", itemsA)
+    ), NoTimers).toList should have length (1)
+
+    val o = p.handleInputRows(testKey, Iterator(
+      pulse(2_000L, "ChampionKill", "assist", 42L)
+    ), NoTimers).toList
+
+    o should have length 1
+    o.head.items_str shouldBe itemsA
+  }
+
+  test("items-only transition from empty to populated string emits and carries full payload") {
+    val p = newProc()
+    val itemsB = "0:100:Boots of Speed, 1:210:Dagger, 2:350:Rod"
+
+    // Baseline snapshot with items omitted (sets power/level but items remain "")
+    val s1 = p.handleInputRows(testKey, Iterator(
+      snapshot(1_000L, 3, 900.0, 0, 0, 0, 0.0, "Orianna")
+    ), NoTimers).toList
+    s1 should have length 1
+    s1.head.items_str shouldBe "" // initial empty
+
+    // Next snapshot adds items only → emits due to itemsChanged
+    val s2 = p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(2_000L, 3, 900.0, 0, 0, 0, 0.0, "Orianna", itemsB)
+    ), NoTimers).toList
+    s2 should have length 1
+    s2.head.items_str shouldBe itemsB
+    s2.head.level shouldBe 3
+    s2.head.invValue shouldBe 900.0 +- 1e-9
+  }
+
+  test("empty/whitespace items string is ignored (no override) when previous items were set") {
+    val p = newProc()
+    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
+
+    p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(1_000L, 4, 1200.0, 0, 0, 0, 0.0, "Caitlyn", itemsA)
+    ), NoTimers).toList should have length (1)
+
+    // Provide whitespace-only items; processor trims + filters nonEmpty → treated as missing
+    val sWhitespace = snapshotWithItems(2_000L, 4, 1200.0, 0, 0, 0, 0.0, "Caitlyn", "   ")
+    val out = p.handleInputRows(testKey, Iterator(sWhitespace), NoTimers).toList
+    out shouldBe empty
+
+    // Items remain unchanged on next emit
+    val pulseOut = p.handleInputRows(testKey, Iterator(pulse(2_100L, "ChampionKill", "assist", 99L)), NoTimers).toList
+    pulseOut should have length 1
+    pulseOut.head.items_str shouldBe itemsA
   }
 }

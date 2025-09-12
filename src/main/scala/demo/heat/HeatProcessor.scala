@@ -22,7 +22,8 @@ case class HeatIn(
                    kills: Option[Int],
                    deaths: Option[Int],
                    assists: Option[Int],
-                   creepScore: Option[Double]
+                   creepScore: Option[Double],
+                   items_str: Option[String] // string encoded items in the format "[slot]:[itemId]:[displayName], again, .."
                  )
 
 case class HeatState(
@@ -41,7 +42,8 @@ case class HeatState(
 
                       invValue: Double,
                       championName: String,
-                      level: Int
+                      level: Int,
+                      items_str: String
                     )
 
 /** Single event emitted by TWS for the FE to render Heat with low latency.
@@ -69,6 +71,7 @@ case class HeatOut(
                     creepScore: Double,
 
                     invValue: Double,
+                    items_str: String,
                     level: Int,
 
                     // ---- constants the FE needs (kept in payload for transparency/versioning) ----
@@ -99,7 +102,7 @@ final class InMemoryHeatStateStore(init: HeatState) extends HeatStateStore {
 
 object HeatProcessor {
   val InitialState: HeatState = HeatState(
-    p = 0.0, m = 0.0, lastTs = 0L, lastEventId = (-1L), spreeStreak = 0, level = 0,
+    p = 0.0, m = 0.0, lastTs = 0L, lastEventId = (-1L), spreeStreak = 0, level = 0, items_str = "",
     kills = 0, deaths = 0, assists = 0, creepScore = 0.0, invValue = 0.0, championName = ""
   )
 
@@ -230,14 +233,17 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
         val levelOpt = heatIn.level
         val invOpt = heatIn.invValue
 
-        // scoreboard (use provided or fallback to state, then monotone max merge)
         val killsIn = heatIn.kills.getOrElse(st.kills)
         val deathsIn = heatIn.deaths.getOrElse(st.deaths)
         val assistsIn = heatIn.assists.getOrElse(st.assists)
         val csIn = heatIn.creepScore.getOrElse(st.creepScore)
         val champIn = heatIn.championName.getOrElse("")
 
-        // --- monotone merges (never decrease from snapshots) ---
+        // --- items: only from snapshots ---
+        // keep as-is (already stably sorted upstream)
+        val itemsInOpt = heatIn.items_str.map(_.trim).filter(_.nonEmpty)
+
+        // monotone merges for numeric fields
         val levelNew = math.max(st.level, levelOpt.getOrElse(st.level))
         val invNew = math.max(st.invValue, invOpt.getOrElse(st.invValue))
         val kNew = math.max(st.kills, killsIn)
@@ -248,10 +254,14 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
         // sticky champion name (set once, then keep)
         val champNew = if (st.championName.nonEmpty) st.championName else champIn
 
-        // compute power FROM MERGED STATE (prevents accidental drops)
+        // avoid regressing items with an older-timestamp snapshot
+        val acceptItems = heatIn.tsMillis >= st.lastTs
+        val itemsNew = if (acceptItems) itemsInOpt.getOrElse(st.items_str) else st.items_str
+        val itemsChanged = acceptItems && itemsInOpt.exists(_ != st.items_str)
+
+        // compute power FROM MERGED STATE
         val pNew = powerFrom(Some(levelNew), Some(invNew))
 
-        // persist decayed momentum baseline and merged fields
         val st2 = st.copy(
           m = mDec,
           p = pNew,
@@ -259,10 +269,11 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
           invValue = invNew,
           kills = kNew, deaths = dNew, assists = aNew,
           creepScore = csNew, championName = champNew,
-          lastTs = math.max(st.lastTs, ts)
+          items_str = itemsNew,
+          lastTs = math.max(st.lastTs, heatIn.tsMillis)
         )
 
-        // change detection AFTER merge
+        // change detection
         val levelChanged = levelNew > st.level
         val pChanged = math.abs(pNew - st.p) > 1e-6
         val kChanged = kNew > st.kills
@@ -273,7 +284,8 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
         val champChanged = st.championName.isEmpty && champNew.nonEmpty
 
         val snapshotChanged =
-          levelChanged || pChanged || kChanged || dChanged || aChanged || csChanged || invChanged || champChanged
+          levelChanged || pChanged || kChanged || dChanged || aChanged ||
+            csChanged || invChanged || champChanged || itemsChanged
 
         (st2, StepFlags(changedSnapshot = snapshotChanged, changedPulse = false))
     }
@@ -317,6 +329,7 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
       creepScore = st.creepScore,
 
       invValue = st.invValue,
+      items_str = st.items_str,
       level = st.level,
 
       // FE constants
