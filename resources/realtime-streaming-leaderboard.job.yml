@@ -1,0 +1,32 @@
+resources:
+  jobs:
+    realtime-streaming-leaderboard:
+      name: realtime-streaming-leaderboard
+      tasks:
+        - task_key: streaming_notebook
+          notebook_task:
+            source: WORKSPACE
+            notebook_path: ../src/Generate_Heat.ipynb
+          job_cluster_key: real-time-cluster
+          libraries:
+            - jar: ${workspace.artifact_path}/.internal/scala-project-assembly-0.1.jar
+
+      job_clusters:
+        - job_cluster_key: real-time-cluster
+          new_cluster:
+            spark_version: 17.1.x-scala2.13
+            spark_conf:
+              spark.databricks.streaming.realTimeMode.enabled: 'true'
+            aws_attributes:
+              availability: ON_DEMAND
+              zone_id: auto
+            node_type_id: c-fleet.2xlarge
+            driver_node_type_id: m4.xlarge
+            enable_elastic_disk: true
+            single_user_name: alex.vanadio@databricks.com
+            data_security_mode: DATA_SECURITY_MODE_DEDICATED
+            runtime_engine: STANDARD
+            kind: CLASSIC_PREVIEW
+            is_single_node: false
+            num_workers: 2
+            apply_policy_default_values: false
