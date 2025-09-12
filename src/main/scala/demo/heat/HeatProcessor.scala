@@ -102,10 +102,40 @@ object HeatProcessor {
     p = 0.0, m = 0.0, lastTs = 0L, lastEventId = (-1L), spreeStreak = 0, level = 0,
     kills = 0, deaths = 0, assists = 0, creepScore = 0.0, invValue = 0.0, championName = ""
   )
+
+  // ----- POWER (simple: level + inventory value) -----
+  val PowerWLevel = 0.55
+  val PowerWItems = 0.45
+  val LevelMax = 18.0
+  val ItemBudget = 16500.0 // late game high-end inventory appears to be worth about this much
+
+  // ----- MOMENTUM (leaky bucket) -----
+  val HalfLifeSeconds = 45.0
+  val MomentumCap = 130.0
+  val AssistFactor = 0.7
+  val SpreeStep = 2.0 // +2 per kill in current life
+  val SpreeCap = 16.0 // cap of spree bonus
+
+  // Base pulse weights
+  val W_Kill = 14.0
+  val W_Assist = 8.0
+  val W_Death = -6.0
+  val W_FirstBlood = 6.0
+  val W_Dragon = 16.0
+  val W_Baron = 22.0
+  val W_Herald = 10.0
+  val W_Turret = 9.0
+
+  val HeatWPower = 0.45
+  val HeatWMomentum = 0.55
+
+  val momHLms = HalfLifeSeconds * 1000.0
 }
 
 class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None)
   extends StatefulProcessor[String, HeatIn, HeatOut] {
+
+  import HeatProcessor._
 
   @transient private var _sparkValueState: ValueState[HeatState] = _
   @transient private var store: HeatStateStore = injectedStore.orNull
@@ -121,34 +151,6 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
       override def update(s: HeatState): Unit = _sparkValueState.update(s)
     }
   }
-
-  // ----- POWER (simple: level + inventory value) -----
-  private val PowerWLevel = 0.55
-  private val PowerWItems = 0.45
-  private val LevelMax = 18.0
-  private val ItemBudget = 16500.0 // late game high-end inventory appears to be worth about this much
-
-  // ----- MOMENTUM (leaky bucket) -----
-  private val HalfLifeSeconds = 45.0
-  private val MomentumCap = 130.0
-  private val AssistFactor = 0.7
-  private val SpreeStep = 2.0 // +2 per kill in current life
-  private val SpreeCap = 16.0 // cap of spree bonus
-
-  // Base pulse weights
-  private val W_Kill = 14.0
-  private val W_Assist = 8.0
-  private val W_Death = -6.0
-  private val W_FirstBlood = 6.0
-  private val W_Dragon = 16.0
-  private val W_Baron = 22.0
-  private val W_Herald = 10.0
-  private val W_Turret = 9.0
-
-  private val HeatWPower = 0.45
-  private val HeatWMomentum = 0.55
-
-  private val momHLms = HalfLifeSeconds * 1000.0
 
   @inline def decay(value: Double, hlMs: Double, dtMs: Long): Double =
     if (dtMs <= 0L) value else value * math.pow(0.5, dtMs / hlMs)
