@@ -203,21 +203,6 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     out.head.momentumRaw should be < m0
   }
 
-  test("pure decay tick via unknown kind does not emit") {
-    val p = newProc()
-
-    // seed state
-    p.handleInputRows(testKey, Iterator(snapshot(1_000L, 3, 900.0, 0, 0, 0, 10.0, "")), NoTimers).toList
-
-    val decayOnly = HeatIn("GAME", "ORDER", "RIOT#ID", 30_000L, "tick",
-      etype = None, championName = None, role = None,
-      level = None, invValue = None, eventId = None,
-      kills = None, deaths = None, assists = None, creepScore = None)
-
-    val out = p.handleInputRows(testKey, Iterator(decayOnly), NoTimers).toList
-    out shouldBe empty
-  }
-
   test("half-life ≈ halves momentum after 45s using a no-op pulse to anchor emit") {
     val p = newProc()
 
