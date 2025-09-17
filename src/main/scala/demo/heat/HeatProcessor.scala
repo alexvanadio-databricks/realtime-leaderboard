@@ -135,7 +135,9 @@ object HeatProcessor {
   val momHLms = HalfLifeSeconds * 1000.0
 }
 
-class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None)
+class HeatProcessor(ttl: TTLConfig,
+                    injectedStore: Option[HeatStateStore] = None,
+                    nowFn: () => Long = () => System.currentTimeMillis())
   extends StatefulProcessor[String, HeatIn, HeatOut] {
 
   import HeatProcessor._
@@ -169,9 +171,7 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
     if (parts.length == 3) (parts(0), parts(1), parts(2)) else (k, "", "")
   }
 
-  private[heat] case class StepFlags(changedSnapshot: Boolean, changedPulse: Boolean)
-
-  private[heat] def step(st: HeatState, heatIn: HeatIn): (HeatState, StepFlags) = {
+  private[heat] def step(st: HeatState, heatIn: HeatIn): HeatState = {
     val kind = heatIn.kind
     val ts = heatIn.tsMillis
     val dt = math.max(0L, ts - st.lastTs)
@@ -187,11 +187,10 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
         var bonus = 0.0
 
         if (eventId.nonEmpty && eventId.get <= st.lastEventId)
-          return (st.copy(
+          return st.copy(
             m = mDec,
-            lastTs = math.max(st.lastTs, ts)),
-            StepFlags(changedSnapshot = false, changedPulse = false)
-          )
+            lastTs = math.max(st.lastTs, ts))
+
 
         val base = (etype, role) match {
           case (Some("ChampionKill"), Some("killer")) => W_Kill
@@ -224,9 +223,9 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
 
         eventId match {
           case Some(eventId: Long) =>
-            (updatedHeatState.copy(lastEventId = eventId), StepFlags(changedSnapshot = false, changedPulse = true))
+            updatedHeatState.copy(lastEventId = eventId)
           case None =>
-            (updatedHeatState, StepFlags(changedSnapshot = false, changedPulse = true))
+            updatedHeatState
         }
 
       case "snapshot" =>
@@ -257,7 +256,6 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
         // avoid regressing items with an older-timestamp snapshot
         val acceptItems = heatIn.tsMillis >= st.lastTs
         val itemsNew = if (acceptItems) itemsInOpt.getOrElse(st.items_str) else st.items_str
-        val itemsChanged = acceptItems && itemsInOpt.exists(_ != st.items_str)
 
         // compute power FROM MERGED STATE
         val pNew = powerFrom(Some(levelNew), Some(invNew))
@@ -273,37 +271,24 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
           lastTs = math.max(st.lastTs, heatIn.tsMillis)
         )
 
-        // change detection
-        val levelChanged = levelNew > st.level
-        val pChanged = math.abs(pNew - st.p) > 1e-6
-        val kChanged = kNew > st.kills
-        val dChanged = dNew > st.deaths
-        val aChanged = aNew > st.assists
-        val csChanged = csNew > st.creepScore
-        val invChanged = invNew > st.invValue
-        val champChanged = st.championName.isEmpty && champNew.nonEmpty
-
-        val snapshotChanged =
-          levelChanged || pChanged || kChanged || dChanged || aChanged ||
-            csChanged || invChanged || champChanged || itemsChanged
-
-        (st2, StepFlags(changedSnapshot = snapshotChanged, changedPulse = false))
+        st2
     }
   }
 
   private def singleHeatOut(key: String, st: HeatState): HeatOut = {
+    val emitTsMs = nowFn()
+    val dtToNow = math.max(0L, emitTsMs - st.lastTs)
+    val mAtNow = decay(st.m, momHLms, dtToNow)
+
     // identity
     val (gameIdK, riotIdK, teamK) = splitKey(key)
 
     // normalization
-    val nP = math.max(0.0, math.min(100.0, st.p)) // power already on 0..100
-    val nM = math.max(0.0, math.min(100.0, 100.0 * st.m / MomentumCap))
-
-    // blended heat (clamped)
+    val nP = math.max(0.0, math.min(100.0, st.p))
+    val nM = math.max(0.0, math.min(100.0, 100.0 * mAtNow / MomentumCap))
     val heatVal = math.max(0.0, math.min(100.0, HeatWPower * nP + HeatWMomentum * nM))
 
     // provenance / latency
-    val emitTsMs = System.currentTimeMillis()
     val sourceTsMs = st.lastTs
     val backendLatencyMs = math.max(0L, emitTsMs - sourceTsMs)
 
@@ -316,7 +301,7 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
       emitTsMs = emitTsMs,
 
       powerRaw = st.p,
-      momentumRaw = st.m,
+      momentumRaw = mAtNow,
       powerNorm = nP,
       momentumNorm = nM,
       heat = heatVal,
@@ -346,42 +331,20 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
     )
   }
 
-  override def handleInputRows(
-                                key: String,
-                                inputRows: Iterator[HeatIn],
-                                timers: TimerValues): Iterator[HeatOut] = {
-
-    // pull current state (or default)
+  override def handleInputRows(key: String, inputRows: Iterator[HeatIn], timers: TimerValues): Iterator[HeatOut] = {
     var st = Option(store.get()).getOrElse(InitialState)
-
-    // OR-accumulate what changed across all rows in this micro-batch
-    var changedPulse = false
-    var changedSnapshot = false
-
-    // ensure per-key time order; step() uses dt = max(0, ts - lastTs)
     val rows = inputRows.toArray.sortBy(_.tsMillis)
 
+    val outs = scala.collection.mutable.ArrayBuffer[HeatOut]()
     var i = 0
     while (i < rows.length) {
-      val r = rows(i)
-
-      // --- the seam: one row -> (newState, flags) ---
-      val (st2, flags) = step(st, r)
-
-      // accumulate and advance
-      changedPulse ||= flags.changedPulse
-      changedSnapshot ||= flags.changedSnapshot
+      val st2 = step(st, rows(i))
       st = st2
-
+      outs += singleHeatOut(key, st)
       i += 1
     }
-
-    // persist final state for this key
     store.update(st)
-
-    // emit only if something material changed (pulse accepted or snapshot fields advanced)
-    if (changedPulse || changedSnapshot) Iterator(singleHeatOut(key, st))
-    else Iterator.empty
+    outs.iterator
   }
 }
 
