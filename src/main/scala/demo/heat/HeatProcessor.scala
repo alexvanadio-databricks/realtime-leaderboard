@@ -113,22 +113,23 @@ object HeatProcessor {
   val ItemBudget = 16500.0 // late game high-end inventory appears to be worth about this much
 
   // ----- MOMENTUM (leaky bucket) -----
-  val HalfLifeSeconds = 45.0
-  val MomentumCap = 130.0
-  val AssistFactor = 0.7
-  val SpreeStep = 2.0 // +2 per kill in current life
-  val SpreeCap = 16.0 // cap of spree bonus
+  val HalfLifeSeconds = 30.0 // was 45.0  → fades ~1.5× faster (snappier, less “sticky”)
+  val MomentumCap = 70.0 // was 130.0 → every pulse counts more after normalization
+  val AssistFactor = 0.9 // was 0.70  → objectives share more momentum with teammates
+  val SpreeStep = 3.0 // was 2.0   → kill streaks ramp a bit faster
+  val SpreeCap = 15.0 // was 16.0  → tiny trim to avoid runaway
 
-  // Base pulse weights
-  val W_Kill = 14.0
-  val W_Assist = 8.0
-  val W_Death = -6.0
-  val W_FirstBlood = 6.0
-  val W_Dragon = 16.0
-  val W_Baron = 22.0
-  val W_Herald = 10.0
-  val W_Turret = 9.0
+  // Base pulse weights (↑ ~20–25% across the board)
+  val W_Kill = 18.0 // was 14.0
+  val W_Assist = 11.0 // was 8.0
+  val W_Death = -6.0 // unchanged (keeps “cool down” on deaths)
+  val W_FirstBlood = 8.0 // was 6.0
+  val W_Dragon = 22.0 // was 16.0
+  val W_Baron = 28.0 // was 22.0
+  val W_Herald = 13.0 // was 10.0
+  val W_Turret = 11.0 // was 9.0
 
+  // Heat blend (let momentum matter a bit more in the final number)
   val HeatWPower = 0.45
   val HeatWMomentum = 0.55
 
