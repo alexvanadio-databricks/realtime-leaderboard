@@ -194,17 +194,17 @@ class HeatProcessor(ttl: TTLConfig,
 
         val base = (etype, role) match {
           case (Some("ChampionKill"), Some("killer")) => W_Kill
-          case (Some("ChampionKill"), Some("assist")) => W_Assist
+          case (Some("ChampionKill"), Some("assister")) => W_Assist
           case (Some("ChampionKill"), Some("victim")) => W_Death
           case (Some("FirstBlood"), Some("killer")) => W_FirstBlood
           case (Some("DragonKill"), Some("killer")) => W_Dragon
-          case (Some("DragonKill"), Some("assist")) => AssistFactor * W_Dragon
+          case (Some("DragonKill"), Some("assister")) => AssistFactor * W_Dragon
           case (Some("BaronKill"), Some("killer")) => W_Baron
-          case (Some("BaronKill"), Some("assist")) => AssistFactor * W_Baron
+          case (Some("BaronKill"), Some("assister")) => AssistFactor * W_Baron
           case (Some("HeraldKill"), Some("killer")) => W_Herald
-          case (Some("HeraldKill"), Some("assist")) => AssistFactor * W_Herald
+          case (Some("HeraldKill"), Some("assister")) => AssistFactor * W_Herald
           case (Some("TurretKilled"), Some("killer")) => W_Turret
-          case (Some("TurretKilled"), Some("assist")) => AssistFactor * W_Turret
+          case (Some("TurretKilled"), Some("assister")) => AssistFactor * W_Turret
           case _ => 0.0
         }
 

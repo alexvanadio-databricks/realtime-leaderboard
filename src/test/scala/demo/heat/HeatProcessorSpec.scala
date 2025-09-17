@@ -64,17 +64,17 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     val (p, clk) = newProcAt(10_000L)
 
     clk.current = 10_000L
-    val out1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assist", 100L)), NoTimers).toList
+    val out1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 100L)), NoTimers).toList
     val m1 = out1.head.momentumRaw
     m1 should be > 0.0
 
     clk.current = 12_000L
-    val outDup = p.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "assist", 100L)), NoTimers).toList
+    val outDup = p.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "assister", 100L)), NoTimers).toList
     outDup should have length 1
     outDup.head.momentumRaw shouldBe decayFrom(m1, 2000L) +- 1e-9  // deduped pulse → decay only
 
     clk.current = 14_000L
-    val out2 = p.handleInputRows(testKey, Iterator(pulse(14_000L, "ChampionKill", "assist", 101L)), NoTimers).toList
+    val out2 = p.handleInputRows(testKey, Iterator(pulse(14_000L, "ChampionKill", "assister", 101L)), NoTimers).toList
     out2 should have length 1
     out2.head.momentumRaw should be > outDup.head.momentumRaw
   }
@@ -83,12 +83,12 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     val (p, clk) = newProcAt(10_000L)
 
     clk.current = 10_000L
-    val o1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assist", 10L)), NoTimers).toList
+    val o1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 10L)), NoTimers).toList
     val mBefore = o1.head.momentumRaw
 
     // older ts but larger eid → accepted; dt=max(0, 9000-10000)=0 → no decay, only add base
     clk.current = 9_000L
-    val o2 = p.handleInputRows(testKey, Iterator(pulse(9_000L, "ChampionKill", "assist", 11L)), NoTimers).toList
+    val o2 = p.handleInputRows(testKey, Iterator(pulse(9_000L, "ChampionKill", "assister", 11L)), NoTimers).toList
     o2 should have length 1
     o2.head.momentumRaw should be > mBefore
   }
@@ -100,8 +100,8 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
       clkA.current = 12_000L
       pA.handleInputRows(testKey,
         Iterator(
-          pulse(12_000L, "ChampionKill", "assist", 2L),
-          pulse(10_000L, "ChampionKill", "assist", 1L)
+          pulse(12_000L, "ChampionKill", "assister", 2L),
+          pulse(10_000L, "ChampionKill", "assister", 1L)
         ),
         NoTimers
       ).toList
@@ -111,9 +111,9 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
 
     val (pB, clkB) = newProcAt(10_000L)
     clkB.current = 10_000L
-    val b1 = pB.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assist", 1L)), NoTimers).toList
+    val b1 = pB.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 1L)), NoTimers).toList
     clkB.current = 12_000L
-    val b2 = pB.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "assist", 2L)), NoTimers).toList
+    val b2 = pB.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "assister", 2L)), NoTimers).toList
     val mBfinal = b2.last.momentumRaw
 
     mAfinal shouldBe mBfinal +- 1e-9
@@ -128,7 +128,7 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     m0 should be > 0.0
 
     clk.current = 10_000L + (HalfLifeSeconds * 1000L).toLong
-    val o2 = p.handleInputRows(testKey, Iterator(pulse(clk.current, "Noop", "assist", 2L)), NoTimers).toList
+    val o2 = p.handleInputRows(testKey, Iterator(pulse(clk.current, "Noop", "assister", 2L)), NoTimers).toList
     o2.head.momentumRaw shouldBe (m0 / 2.0) +- 1e-9
   }
 
@@ -148,7 +148,7 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
   test("assist vs killer on DragonKill: assist adds less raw momentum than killer") {
     val (p1, c1) = newProcAt(10_000L)
     c1.current = 10_000L
-    val a = p1.handleInputRows(testKey, Iterator(pulse(10_000L, "DragonKill", "assist", 1L)), NoTimers).toList.head.momentumRaw
+    val a = p1.handleInputRows(testKey, Iterator(pulse(10_000L, "DragonKill", "assister", 1L)), NoTimers).toList.head.momentumRaw
 
     val (p2, c2) = newProcAt(10_000L)
     c2.current = 10_000L
@@ -279,7 +279,7 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
 
     // next pulse should still carry itemsB
     clk.current = 3_000L
-    val pOut = p.handleInputRows(testKey, Iterator(pulse(3_000L, "ChampionKill", "assist", 42L)), NoTimers).toList
+    val pOut = p.handleInputRows(testKey, Iterator(pulse(3_000L, "ChampionKill", "assister", 42L)), NoTimers).toList
     pOut.head.items_str shouldBe itemsB
   }
 
@@ -324,7 +324,7 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     val (p, clk) = newProcAt(10_000L)
 
     clk.current = 10_000L
-    val k1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assist", 1L)), NoTimers).toList
+    val k1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 1L)), NoTimers).toList
     val m0 = k1.head.momentumRaw
 
     clk.current = 55_000L
@@ -342,11 +342,11 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     val (p, clk) = newProcAt(10_000L)
 
     clk.current = 10_000L
-    val a1 = p.handleInputRows(testKey, Iterator(pulseNoEid(10_000L, "ChampionKill", "assist")), NoTimers).toList
+    val a1 = p.handleInputRows(testKey, Iterator(pulseNoEid(10_000L, "ChampionKill", "assister")), NoTimers).toList
     val m1 = a1.head.momentumRaw
 
     clk.current = 12_000L
-    val a2 = p.handleInputRows(testKey, Iterator(pulseNoEid(12_000L, "ChampionKill", "assist")), NoTimers).toList
+    val a2 = p.handleInputRows(testKey, Iterator(pulseNoEid(12_000L, "ChampionKill", "assister")), NoTimers).toList
     a2.head.momentumRaw should be > m1
   }
 
@@ -393,8 +393,8 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     val out = p.handleInputRows(
       testKey,
       Iterator(
-        pulse(10_000L, "ChampionKill", "assist", 1L),
-        pulse(10_000L, "ChampionKill", "assist", 2L) // larger eid, same ts → dt=0
+        pulse(10_000L, "ChampionKill", "assister", 1L),
+        pulse(10_000L, "ChampionKill", "assister", 2L) // larger eid, same ts → dt=0
       ),
       NoTimers
     ).toList
@@ -427,7 +427,7 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
 
     // seed a little momentum
     clk.current = 10_000L
-    p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assist", 1L)), NoTimers).toList.head.momentumRaw should be > 0.0
+    p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 1L)), NoTimers).toList.head.momentumRaw should be > 0.0
 
     // two deaths back-to-back
     clk.current = 11_000L
@@ -451,8 +451,105 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     // Advance 4 half-lives → expected ≈ m0 * (1/16)
     val t = 10_000L + (4 * HalfLifeSeconds * 1000L).toLong
     clk.current = t
-    val o2 = p.handleInputRows(testKey, Iterator(pulse(t, "Noop", "assist", 2L)), NoTimers).toList.head
+    val o2 = p.handleInputRows(testKey, Iterator(pulse(t, "Noop", "assister", 2L)), NoTimers).toList.head
     val expected = m0 / 16.0
     o2.momentumRaw shouldBe expected +- (m0 * 1e-6) // tight tolerance
+  }
+
+  test("producer replay: identical pulse payload with new eid double-counts momentum") {
+    val (p, clk) = newProcAt(10_000L)
+
+    clk.current = 10_000L
+    val a1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 1L)), NoTimers).toList
+    a1 should have length 1
+    val m1 = a1.head.momentumRaw
+    m1 should be > 0.0
+
+    // Same payload, newer eid → adds again
+    clk.current = 10_000L
+    val a2 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 2L)), NoTimers).toList
+    a2 should have length 1
+    a2.head.momentumRaw should be > m1
+  }
+
+  test("missing eventId on repeated assists inflates momentum") {
+    val (p, clk) = newProcAt(10_000L)
+
+    clk.current = 10_000L
+    val a1 = p.handleInputRows(testKey, Iterator(pulseNoEid(10_000L, "ChampionKill", "assister")), NoTimers).toList
+    val m1 = a1.head.momentumRaw
+    m1 should be > 0.0
+
+    clk.current = 10_050L
+    val a2 = p.handleInputRows(testKey, Iterator(pulseNoEid(10_050L, "ChampionKill", "assister")), NoTimers).toList
+    val m2 = a2.head.momentumRaw
+    m2 should be > m1
+
+    clk.current = 10_100L
+    val a3 = p.handleInputRows(testKey, Iterator(pulseNoEid(10_100L, "ChampionKill", "assister")), NoTimers).toList
+    a3.head.momentumRaw should be > m2
+  }
+
+  test("out-of-order pulse with higher eid (dt=0) still adds momentum") {
+    val (p, clk) = newProcAt(10_000L)
+
+    clk.current = 10_000L
+    val o1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 10L)), NoTimers).toList
+    val mBefore = o1.head.momentumRaw
+    mBefore should be > 0.0
+
+    // Older ts but larger eid → accepted; no decay because dt=max(0, 9000-10000)=0
+    clk.current = 9_000L
+    val o2 = p.handleInputRows(testKey, Iterator(pulse(9_000L, "ChampionKill", "assister", 11L)), NoTimers).toList
+    o2 should have length 1
+    o2.head.momentumRaw should be > mBefore
+  }
+
+  test("unknown pulse type (higher eid) anchors decay without adding momentum") {
+    val (p, clk) = newProcAt(10_000L)
+
+    // Seed some momentum
+    clk.current = 10_000L
+    val seed = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 1L)), NoTimers).toList
+    val m0 = seed.head.momentumRaw
+    m0 should be > 0.0
+
+    // After exactly one half-life, emit an unknown-type pulse with higher eid.
+    // Base weight = 0, so we should see pure decay to ~m0/2.
+    val halfMs = (HalfLifeSeconds * 1000).toLong
+    clk.current = 10_000L + halfMs
+    val anchor = p.handleInputRows(testKey, Iterator(pulse(10_000L + halfMs, "Noop", "assister", 2L)), NoTimers).toList
+    anchor should have length 1
+    anchor.head.momentumRaw shouldBe (m0 / 2.0) +- 1e-9
+  }
+
+  test("OOO accepted pulse raises baseline; next valid pulse shows jump vs pure decay") {
+    val (p, clk) = newProcAt(10_000L)
+
+    // Establish m1
+    clk.current = 10_000L
+    val first = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "killer", 5L)), NoTimers).toList
+    val m1 = first.head.momentumRaw
+    m1 should be > 0.0
+
+    // Dedup by id (older id) at later ts → decay-only state update, but we won’t emit here
+    // (If your code always emits, switch this step to a snapshot to compare against pure decay)
+    clk.current = 12_000L
+    val dupOlderId = p.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "killer", 4L)), NoTimers).toList
+    // If your processor "always emits", allow either empty or a single decayed frame:
+    dupOlderId.length should (be(0) or be(1))
+
+    // Snapshot at 12_001 shows pure decay of m1 over 2001 ms
+    clk.current = 12_001L
+    val outSnap = p.handleInputRows(testKey, Iterator(snapshot(12_001L, 6, 0.0, 0, 0, 0, 0.0, "")), NoTimers).toList
+    outSnap should have length 1
+    val expected = m1 * math.pow(0.5, (12_001L - 10_000L) / (HalfLifeSeconds * 1000.0))
+    outSnap.head.momentumRaw shouldBe expected +- 1e-9
+
+    // New valid pulse raises above the pure-decay baseline
+    clk.current = 12_002L
+    val outNext = p.handleInputRows(testKey, Iterator(pulse(12_002L, "ChampionKill", "assister", 6L)), NoTimers).toList
+    outNext should have length 1
+    outNext.head.momentumRaw should be > expected
   }
 }
