@@ -1,7 +1,7 @@
-# This is a Databricks asset bundle definition for scala-project.
+# This is a Databricks asset bundle definition for realtime-leaderboard.
 # See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
 bundle:
-  name: scala-project
+  name: realtime-leaderboard
   uuid: 70034e10-11cb-4de6-b603-39339f9d6678
 
 include:
@@ -17,7 +17,7 @@ artifacts:
     build: sbt package && sbt assembly
     path: .
     files:
-      - source: ./target/scala-2.13/scala-project-assembly-0.1.jar
+      - source: ./target/scala-2.13/realtime-leaderboard-assembly-0.1.jar
 
 targets:
   dev:

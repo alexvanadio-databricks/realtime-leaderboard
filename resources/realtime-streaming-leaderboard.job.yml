@@ -9,7 +9,7 @@ resources:
             notebook_path: ../src/Generate_Heat.ipynb
           job_cluster_key: real-time-cluster
           libraries:
-            - jar: ${workspace.artifact_path}/.internal/scala-project-assembly-0.1.jar
+            - jar: ${workspace.artifact_path}/.internal/realtime-leaderboard-assembly-0.1.jar
 
       job_clusters:
         - job_cluster_key: real-time-cluster

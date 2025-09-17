@@ -2,7 +2,7 @@
 // This also includes the instructions on how to to create the jar uploaded via databricks bundle
 scalaVersion := "2.13.16"
 
-name := "scala-project"
+name := "realtime-leaderboard"
 organization := "com.examples"
 version := "0.1"
 
