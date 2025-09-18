@@ -34,20 +34,20 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
   // ---- helpers to build HeatIn -------------------------------------------------
   private def pulse(ts: Long, et: String, role: String, eid: Long) =
     HeatIn("GAME", "ORDER", "RIOT#ID", ts, "pulse", Some(et), None, Some(role),
-      None, None, Some(eid), None, None, None, None, None)
+      None, None, Some(eid), None, None, None, None, None, None)
 
   private def pulseNoEid(ts: Long, et: String, role: String) =
     HeatIn("GAME", "ORDER", "RIOT#ID", ts, "pulse", Some(et), None, Some(role),
-      None, None, None, None, None, None, None, None)
+      None, None, None, None, None, None, None, None, None)
 
   private def snapshot(ts: Long, level: Int, inv: Double, k: Int, d: Int, a: Int, cs: Double, champ: String) =
     HeatIn("GAME", "ORDER", "RIOT#ID", ts, "snapshot", None, Some(champ), None,
-      Some(level), Some(inv), None, Some(k), Some(d), Some(a), Some(cs), None)
+      Some(level), Some(inv), None, Some(k), Some(d), Some(a), Some(cs), None, None)
 
   private def snapshotWithItems(ts: Long, level: Int, inv: Double, k: Int,
                                 d: Int, a: Int, cs: Double, champ: String, items: String) =
     HeatIn("GAME", "ORDER", "RIOT#ID", ts, "snapshot", None, Some(champ), None,
-      Some(level), Some(inv), None, Some(k), Some(d), Some(a), Some(cs), Some(items))
+      Some(level), Some(inv), None, Some(k), Some(d), Some(a), Some(cs), Some(items), None)
 
   // No timers used by our code; pass null safely.
   private val NoTimers: TimerValues = null.asInstanceOf[TimerValues]
@@ -59,6 +59,40 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
   // ------------------------------------------------------------------------------
   // Core momentum + dedupe + ordering
   // ------------------------------------------------------------------------------
+
+  test("We correctly know when a champion is dead") {
+    val p = newProc()
+    val out1 = p.handleInputRows(
+      testKey,
+      Iterator(snapshot(10_000L, 6, 1500.0, 2, 1, 3, 70.0, "MonkeyKing").copy(isDead = Some(false))),
+      NoTimers
+    ).toList
+    out1.head.isDead shouldEqual false
+
+    // we actually DO NOT use this pulse event to set death. We technically could, and maybe should,
+    // but snapshot is just as easy to use. An improvement is to use both, but that seems like overkill
+    val out2 = p.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "victim", 100L)), NoTimers).toList
+    out2.head.isDead shouldEqual false
+
+    val out3 = p.handleInputRows(
+      testKey,
+      Iterator(snapshot(12_300L, 6, 1500.0, 2, 2, 3, 70.0, "MonkeyKing").copy(isDead = Some(true))),
+      NoTimers
+    ).toList
+    out3.head.isDead shouldEqual true
+
+    // Revenge assist!
+    val out4 = p.handleInputRows(testKey, Iterator(pulse(16_000L, "ChampionKill", "assist", 101L)), NoTimers).toList
+    out4.head.isDead shouldEqual true
+
+    // live again!
+    val out5 = p.handleInputRows(
+      testKey,
+      Iterator(snapshot(18_000L, 6, 1500.0, 2, 2, 3, 70.0, "MonkeyKing").copy(isDead = Some(false))),
+      NoTimers
+    ).toList
+    out5.head.isDead shouldEqual false
+  }
 
   test("assist yields momentum; duplicate eid emits a purely decayed frame; next eid increases momentum") {
     val (p, clk) = newProcAt(10_000L)
@@ -331,7 +365,7 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
     val anchor = HeatIn("GAME", "ORDER", "RIOT#ID", 55_000L, "pulse",
       etype = Some("ChampionKill"), championName = None, role = None,
       level = None, invValue = None, eventId = Some(2L),
-      kills = None, deaths = None, assists = None, creepScore = None, items_str = None)
+      kills = None, deaths = None, assists = None, creepScore = None, items_str = None, isDead = None)
 
     val out = p.handleInputRows(testKey, Iterator(anchor), NoTimers).toList
     out.head.momentumRaw shouldBe decayFrom(m0, 45_000L) +- 1e-9

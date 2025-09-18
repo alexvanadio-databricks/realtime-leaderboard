@@ -16,6 +16,7 @@ case class HeatIn(
                    deaths: Option[Int],
                    assists: Option[Int],
                    creepScore: Option[Double],
-                   items_str: Option[String] // string encoded items in the format "[slot]:[itemId]:[displayName], again, .."
+                   items_str: Option[String], // string encoded items in the format "[slot]:[itemId]:[displayName], again, .."
+                   isDead: Option[Boolean]
                  )
 

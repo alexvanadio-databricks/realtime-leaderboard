@@ -16,6 +16,7 @@ case class HeatState(
 
                       invValue: Double,
                       championName: String,
+                      isDead: Boolean,
                       level: Int,
                       items_str: String
                     )

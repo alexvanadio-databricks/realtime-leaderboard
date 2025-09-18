@@ -8,6 +8,7 @@ case class HeatOut(
                     team: String,
                     riotId: String, // Player identifier within the game; the second part of the key
                     championName: String,
+                    isDead: Boolean,
                     emitTsMs: Long, // Server-side epoch ms when this record was emitted (anchor for FE projection)
                     powerRaw: Double, // Power at emit time, normalized to [0..100] (from level/items)
                     momentumRaw: Double, // Momentum accumulator at emit time (raw/unbounded, pre-normalization)

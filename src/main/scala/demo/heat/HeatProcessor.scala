@@ -6,7 +6,7 @@ import org.apache.spark.sql.streaming._
 object HeatProcessor {
   val InitialState: HeatState = HeatState(
     p = 0.0, m = 0.0, lastTs = 0L, lastEventId = (-1L), spreeStreak = 0, level = 0, items_str = "",
-    kills = 0, deaths = 0, assists = 0, creepScore = 0.0, invValue = 0.0, championName = ""
+    kills = 0, deaths = 0, assists = 0, creepScore = 0.0, invValue = 0.0, championName = "", isDead = false
   )
 
   // ----- POWER (simple: level + inventory value) -----
@@ -16,7 +16,7 @@ object HeatProcessor {
   val ItemBudget = 16500.0 // late game high-end inventory appears to be worth about this much
 
   // ----- MOMENTUM (leaky bucket) -----
-  val HalfLifeSeconds = 30.0 // was 45.0  → fades ~1.5× faster (snappier, less “sticky”)
+  val HalfLifeSeconds = 40.0 // was 45.0  → fades faster (snappier, less “sticky”)
   val MomentumCap = 70.0 // was 130.0 → every pulse counts more after normalization
   val AssistFactor = 0.9 // was 0.70  → objectives share more momentum with teammates
   val SpreeStep = 3.0 // was 2.0   → kill streaks ramp a bit faster
@@ -32,9 +32,9 @@ object HeatProcessor {
   val W_Herald = 13.0 // was 10.0
   val W_Turret = 11.0 // was 9.0
 
-  // Heat blend (let momentum matter a bit more in the final number)
-  val HeatWPower = 0.45
-  val HeatWMomentum = 0.55
+  // Heat blend - power and momentum contribute the same
+  val HeatWPower = 0.5
+  val HeatWMomentum = 0.5
 
   val momHLms = HalfLifeSeconds * 1000.0
 }
@@ -171,6 +171,7 @@ class HeatProcessor(ttl: TTLConfig,
           invValue = invNew,
           kills = kNew, deaths = dNew, assists = aNew,
           creepScore = csNew, championName = champNew,
+          isDead = heatIn.isDead.getOrElse(st.isDead),
           items_str = itemsNew,
           lastTs = math.max(st.lastTs, heatIn.tsMillis)
         )
@@ -201,6 +202,7 @@ class HeatProcessor(ttl: TTLConfig,
       team = teamK,
       riotId = riotIdK,
       championName = st.championName,
+      isDead = st.isDead,
 
       emitTsMs = emitTsMs,
 
