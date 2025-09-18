@@ -3,10 +3,16 @@ resources:
     realtime-streaming-leaderboard:
       name: realtime-streaming-leaderboard
       tasks:
+        - task_key: populate_reference_table
+          notebook_task:
+            source: WORKSPACE
+            notebook_path: "../src/Download and Persist Items.ipynb"
         - task_key: streaming_notebook
           notebook_task:
             source: WORKSPACE
             notebook_path: ../src/Generate_Heat.ipynb
+          depends_on:
+            - task_key: populate_reference_table
           job_cluster_key: real-time-cluster
           libraries:
             - jar: ${workspace.artifact_path}/.internal/realtime-leaderboard-assembly-0.1.jar
