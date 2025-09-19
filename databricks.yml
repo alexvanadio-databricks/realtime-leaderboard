@@ -9,7 +9,7 @@ include:
 
 workspace:
   host: https://e2-demo-field-eng.cloud.databricks.com
-  artifact_path: /Volumes/users/alex_vanadio/test_volume/${bundle.name}/${bundle.target}/${workspace.current_user.short_name}
+  artifact_path: /Volumes/users/alex_vanadio/realtime_leaderboard/${bundle.name}/${bundle.target}/${workspace.current_user.short_name}
 
 artifacts:
   default:
@@ -28,12 +28,12 @@ targets:
     mode: development
     default: true
     workspace:
-      host: https://e2-demo-field-eng.cloud.databricks.com
+      host: https://adb-984752964297111.11.azuredatabricks.net
 
   prod:
     mode: production
     workspace:
-      host: https://e2-demo-field-eng.cloud.databricks.com
+      host: https://adb-984752964297111.11.azuredatabricks.net
       # We explicitly deploy to /Workspace/Users/alex.vanadio@databricks.com to make sure we only have a single copy.
       root_path: /Workspace/Users/alex.vanadio@databricks.com/.bundle/${bundle.name}/${bundle.target}
     permissions:

@@ -23,11 +23,13 @@ resources:
             spark_version: 17.1.x-scala2.13
             spark_conf:
               spark.databricks.streaming.realTimeMode.enabled: 'true'
-            aws_attributes:
-              availability: ON_DEMAND
-              zone_id: auto
-            node_type_id: c-fleet.2xlarge
-            driver_node_type_id: m4.xlarge
+#            aws_attributes:
+#              availability: ON_DEMAND
+#              zone_id: auto
+#            node_type_id: c-fleet.2xlarge
+#            driver_node_type_id: m4.xlarge
+            node_type_id: Standard_F4
+            driver_node_type_id: Standard_DS3_v2
             enable_elastic_disk: true
             single_user_name: alex.vanadio@databricks.com
             data_security_mode: DATA_SECURITY_MODE_DEDICATED

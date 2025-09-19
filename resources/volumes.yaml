@@ -1,0 +1,6 @@
+resources:
+  volumes:
+    realtime_leaderboard_volume:
+      catalog_name: users
+      name: realtime_leaderboard
+      schema_name: alex_vanadio
