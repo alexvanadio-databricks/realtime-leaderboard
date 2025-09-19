@@ -17,7 +17,7 @@ artifacts:
     build: sbt package && sbt assembly
     path: .
     files:
-      - source: ./target/scala-2.13/realtime-leaderboard-assembly-0.1.jar
+      - source: ./target/scala-2.13/realtime-leaderboard-assembly-1.0.0.jar
 
 targets:
   dev:

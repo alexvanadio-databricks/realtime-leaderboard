@@ -15,7 +15,7 @@ resources:
             - task_key: populate_reference_table
           job_cluster_key: real-time-cluster
           libraries:
-            - jar: ${workspace.artifact_path}/.internal/realtime-leaderboard-assembly-0.1.jar
+            - jar: ${workspace.artifact_path}/.internal/realtime-leaderboard-assembly-1.0.0.jar
 
       job_clusters:
         - job_cluster_key: real-time-cluster

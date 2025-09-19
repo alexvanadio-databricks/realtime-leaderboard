@@ -72,7 +72,8 @@ class HeatProcessor(ttl: TTLConfig,
 
   private def splitKey(k: String): (String, String, String) = {
     val parts = k.split("\\|", 3)
-    if (parts.length == 3) (parts(0), parts(1), parts(2)) else (k, "", "")
+    if (parts.length == 3) (parts(0), parts(1), parts(2))
+    else throw new IllegalStateException(s"Could not extract parts from $k")
   }
 
   private[heat] def step(st: HeatState, heatIn: HeatIn): HeatState = {
