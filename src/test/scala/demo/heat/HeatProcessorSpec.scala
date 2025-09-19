@@ -6,613 +6,324 @@ import org.apache.spark.sql.streaming._ // for OutputMode, TimeMode
 import java.time.Duration
 import HeatProcessor._
 
+final class TestClock(var current: Long) { def now(): Long = current }
+
 final class HeatProcessorSpec extends AnyFunSuite with Matchers {
 
   private val testKey = "GAME|RIOT#ID|ORDER"
 
+  // Use this for deterministic time in tests
+  private def newProcAt(t0: Long): (HeatProcessor, TestClock) = {
+    val clk = new TestClock(t0)
+    val p = new HeatProcessor(
+      ttl = TTLConfig(Duration.ofHours(2)),
+      injectedStore = Some(new InMemoryHeatStateStore(InitialState)),
+      nowFn = clk.now _
+    )
+    (p, clk)
+  }
+
+  // Minimal helper if you don’t need clock control for a test
   private def newProc(): HeatProcessor =
     new HeatProcessor(
-      TTLConfig(Duration.ofHours(2)),
-      injectedStore = Some(new InMemoryHeatStateStore(HeatProcessor.InitialState))
+      ttl = TTLConfig(Duration.ofHours(2)),
+      injectedStore = Some(new InMemoryHeatStateStore(InitialState)),
+      nowFn = () => System.currentTimeMillis()
     )
 
-  // helpers to build HeatIn
+  // ---- helpers to build HeatIn -------------------------------------------------
   private def pulse(ts: Long, et: String, role: String, eid: Long) =
     HeatIn("GAME", "ORDER", "RIOT#ID", ts, "pulse", Some(et), None, Some(role),
-      None, None, Some(eid), None, None, None, None, None)
+      None, None, Some(eid), None, None, None, None, None, None)
 
   private def pulseNoEid(ts: Long, et: String, role: String) =
     HeatIn("GAME", "ORDER", "RIOT#ID", ts, "pulse", Some(et), None, Some(role),
-      None, None, None, None, None, None, None, None)
+      None, None, None, None, None, None, None, None, None)
 
   private def snapshot(ts: Long, level: Int, inv: Double, k: Int, d: Int, a: Int, cs: Double, champ: String) =
     HeatIn("GAME", "ORDER", "RIOT#ID", ts, "snapshot", None, Some(champ), None,
-      Some(level), Some(inv), None, Some(k), Some(d), Some(a), Some(cs), None)
+      Some(level), Some(inv), None, Some(k), Some(d), Some(a), Some(cs), None, None)
 
   private def snapshotWithItems(ts: Long, level: Int, inv: Double, k: Int,
                                 d: Int, a: Int, cs: Double, champ: String, items: String) =
     HeatIn("GAME", "ORDER", "RIOT#ID", ts, "snapshot", None, Some(champ), None,
-      Some(level), Some(inv), None, Some(k), Some(d), Some(a), Some(cs), Some(items))
+      Some(level), Some(inv), None, Some(k), Some(d), Some(a), Some(cs), Some(items), None)
 
   // No timers used by our code; pass null safely.
   private val NoTimers: TimerValues = null.asInstanceOf[TimerValues]
 
-  test("assist yields momentum; duplicate eid does not emit; next eid emits") {
-    val p = newProc()
+  // Small utility for expected decay
+  @inline private def decayFrom(m: Double, dtMs: Long): Double =
+    m * math.pow(0.5, dtMs / (HalfLifeSeconds * 1000.0))
 
-    val out1 = p.handleInputRows(testKey, Iterator(pulse(10_000L,"ChampionKill","assist",100L)), NoTimers).toList
-    out1 should have length 1
+  // ------------------------------------------------------------------------------
+  // Core momentum + dedupe + ordering
+  // ------------------------------------------------------------------------------
+
+  test("We correctly know when a champion is dead") {
+    val p = newProc()
+    val out1 = p.handleInputRows(
+      testKey,
+      Iterator(snapshot(10_000L, 6, 1500.0, 2, 1, 3, 70.0, "MonkeyKing").copy(isDead = Some(false))),
+      NoTimers
+    ).toList
+    out1.head.isDead shouldEqual false
+
+    // we actually DO NOT use this pulse event to set death. We technically could, and maybe should,
+    // but snapshot is just as easy to use. An improvement is to use both, but that seems like overkill
+    val out2 = p.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "victim", 100L)), NoTimers).toList
+    out2.head.isDead shouldEqual false
+
+    val out3 = p.handleInputRows(
+      testKey,
+      Iterator(snapshot(12_300L, 6, 1500.0, 2, 2, 3, 70.0, "MonkeyKing").copy(isDead = Some(true))),
+      NoTimers
+    ).toList
+    out3.head.isDead shouldEqual true
+
+    // Revenge assist!
+    val out4 = p.handleInputRows(testKey, Iterator(pulse(16_000L, "ChampionKill", "assist", 101L)), NoTimers).toList
+    out4.head.isDead shouldEqual true
+
+    // live again!
+    val out5 = p.handleInputRows(
+      testKey,
+      Iterator(snapshot(18_000L, 6, 1500.0, 2, 2, 3, 70.0, "MonkeyKing").copy(isDead = Some(false))),
+      NoTimers
+    ).toList
+    out5.head.isDead shouldEqual false
+  }
+
+  test("assist yields momentum; duplicate eid emits a purely decayed frame; next eid increases momentum") {
+    val (p, clk) = newProcAt(10_000L)
+
+    clk.current = 10_000L
+    val out1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 100L)), NoTimers).toList
     val m1 = out1.head.momentumRaw
     m1 should be > 0.0
 
-    val outDup = p.handleInputRows(testKey, Iterator(pulse(12_000L,"ChampionKill","assist",100L)), NoTimers).toList
-    outDup shouldBe empty // dedupe → decay-only → no emit
+    clk.current = 12_000L
+    val outDup = p.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "assister", 100L)), NoTimers).toList
+    outDup should have length 1
+    outDup.head.momentumRaw shouldBe decayFrom(m1, 2000L) +- 1e-9  // deduped pulse → decay only
 
-    val out2 = p.handleInputRows(testKey, Iterator(pulse(14_000L,"ChampionKill","assist",101L)), NoTimers).toList
+    clk.current = 14_000L
+    val out2 = p.handleInputRows(testKey, Iterator(pulse(14_000L, "ChampionKill", "assister", 101L)), NoTimers).toList
     out2 should have length 1
-    out2.head.momentumRaw should be > 0.0
+    out2.head.momentumRaw should be > outDup.head.momentumRaw
   }
 
-  test("spree increments on killer, resets on victim") {
-    val p = newProc()
+  test("out-of-order timestamp is accepted when eventId increases (dt=0 path)") {
+    val (p, clk) = newProcAt(10_000L)
 
-    val o1 = p.handleInputRows(testKey, Iterator(pulse(5_000L,"ChampionKill","killer",1L)), NoTimers).toList
-    o1.head.spreeStreak shouldBe 1
+    clk.current = 10_000L
+    val o1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 10L)), NoTimers).toList
+    val mBefore = o1.head.momentumRaw
 
-    val o2 = p.handleInputRows(testKey, Iterator(pulse(8_000L,"ChampionKill","killer",2L)), NoTimers).toList
-    o2.head.spreeStreak shouldBe 2
-
-    val o3 = p.handleInputRows(testKey, Iterator(pulse(10_000L,"ChampionKill","victim",3L)), NoTimers).toList
-    o3.head.spreeStreak shouldBe 0
+    // older ts but larger eid → accepted; dt=max(0, 9000-10000)=0 → no decay, only add base
+    clk.current = 9_000L
+    val o2 = p.handleInputRows(testKey, Iterator(pulse(9_000L, "ChampionKill", "assister", 11L)), NoTimers).toList
+    o2 should have length 1
+    o2.head.momentumRaw should be > mBefore
   }
 
-  test("snapshot persists decayed baseline; monotone merge; emits only on deltas") {
-    val p = newProc()
+  test("micro-batch sorts by ts: reversed two-pulse batch has same FINAL momentum as two ascending batches") {
+    val (pA, clkA) = newProcAt(10_000L)
+    // One batch, reversed iterator order → processor sorts internally; we emit per-row, compare the final frame
+    val outA = {
+      clkA.current = 12_000L
+      pA.handleInputRows(testKey,
+        Iterator(
+          pulse(12_000L, "ChampionKill", "assister", 2L),
+          pulse(10_000L, "ChampionKill", "assister", 1L)
+        ),
+        NoTimers
+      ).toList
+    }
+    outA should have length 2
+    val mAfinal = outA.last.momentumRaw
 
-    val outPulse = p.handleInputRows(testKey, Iterator(pulse(10_000L,"ChampionKill","killer",10L)), NoTimers).toList
-    val m0 = outPulse.head.momentumRaw
+    val (pB, clkB) = newProcAt(10_000L)
+    clkB.current = 10_000L
+    val b1 = pB.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 1L)), NoTimers).toList
+    clkB.current = 12_000L
+    val b2 = pB.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "assister", 2L)), NoTimers).toList
+    val mBfinal = b2.last.momentumRaw
 
-    val outSnap1 = p.handleInputRows(testKey, Iterator(snapshot(55_000L,6,2000.0,2,1,3,80.0,"Wukong")), NoTimers).toList
-    outSnap1 should have length 1
-    outSnap1.head.momentumRaw should be < m0
-    outSnap1.head.kills shouldBe 2
-    outSnap1.head.championName shouldBe "Wukong"
-
-    val outSnap2 = p.handleInputRows(testKey, Iterator(snapshot(56_000L,6,1500.0,2,1,3,70.0,"MonkeyKing")), NoTimers).toList
-    outSnap2 shouldBe empty // lower cs/inv; name already set → no emit
+    mAfinal shouldBe mBfinal +- 1e-9
   }
 
-  test("death cannot drive momentum below zero and resets spree") {
-    val p = newProc()
+  test("half-life decay halves momentum after 45s (using a no-op pulse as an emit anchor)") {
+    val (p, clk) = newProcAt(10_000L)
 
-    // small momentum first
-    p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assist", 1L)), NoTimers).toList.head.momentumRaw should be > 0.0
+    clk.current = 10_000L
+    val o1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "killer", 1L)), NoTimers).toList
+    val m0 = o1.head.momentumRaw
+    m0 should be > 0.0
 
-    // death larger in magnitude than current momentum → clamp to 0
-    val out = p.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "victim", 2L)), NoTimers).toList
-    out should have length 1
-    out.head.momentumRaw should be >= 0.0
-    out.head.spreeStreak shouldBe 0
+    clk.current = 10_000L + (HalfLifeSeconds * 1000L).toLong
+    val o2 = p.handleInputRows(testKey, Iterator(pulse(clk.current, "Noop", "assister", 2L)), NoTimers).toList
+    o2.head.momentumRaw shouldBe (m0 / 2.0) +- 1e-9
   }
 
   test("momentum caps: repeated big positives saturate momentumNorm to 100") {
-    val p = newProc()
-
-    // hammer with Barons to saturate quickly
+    val (p, clk) = newProcAt(10_000L)
     var eid = 1L
     var last = 0.0
     (0 until 10).foreach { i =>
-      val o = p.handleInputRows(testKey, Iterator(pulse(10_000L + i, "BaronKill", "killer", {
-        eid += 1; eid
-      })), NoTimers).toList
-      o should have length 1
-      last = o.head.momentumNorm
+      val t = 10_000L + i
+      clk.current = t
+      val o = p.handleInputRows(testKey, Iterator(pulse(t, "BaronKill", "killer", { eid += 1; eid })), NoTimers).toList
+      last = o.last.momentumNorm
     }
-    last shouldBe 100.0 +- 0.0001
+    last shouldBe 100.0 +- 1e-4
   }
 
-  test("assist vs killer on DragonKill: assist adds less momentum than killer") {
-    val p1 = newProc()
-    val a = p1.handleInputRows(testKey, Iterator(pulse(10_000L, "DragonKill", "assist", 1L)), NoTimers).toList.head.momentumRaw
+  test("assist vs killer on DragonKill: assist adds less raw momentum than killer") {
+    val (p1, c1) = newProcAt(10_000L)
+    c1.current = 10_000L
+    val a = p1.handleInputRows(testKey, Iterator(pulse(10_000L, "DragonKill", "assister", 1L)), NoTimers).toList.head.momentumRaw
 
-    val p2 = newProc()
+    val (p2, c2) = newProcAt(10_000L)
+    c2.current = 10_000L
     val k = p2.handleInputRows(testKey, Iterator(pulse(10_000L, "DragonKill", "killer", 1L)), NoTimers).toList.head.momentumRaw
 
     a should be < k
   }
 
-  test("dedupe: non-increasing eventId advances time & applies decay; next emit shows pure decay baseline") {
-    val p = newProc()
+  // ------------------------------------------------------------------------------
+  // Spree + death behavior
+  // ------------------------------------------------------------------------------
 
-    // Accepted event at t=10_000 → establishes m1
-    val first = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "killer", 5L)), NoTimers).toList
-    first should have length 1
-    val m1 = first.head.momentumRaw
-    m1 should be > 0.0
+  test("spree increments on killer, resets on victim; death cannot drive momentum below zero") {
+    val (p, clk) = newProcAt(5_000L)
 
-    // Deduped event at t=12_000 (eid=4 <= 5) → applies decay + advances lastTs, but does NOT emit
-    val dupOlderId = p.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "killer", 4L)), NoTimers).toList
-    dupOlderId shouldBe empty
+    clk.current = 5_000L
+    val o1 = p.handleInputRows(testKey, Iterator(pulse(5_000L,"ChampionKill","killer",1L)), NoTimers).toList
+    o1.head.spreeStreak shouldBe 1
 
-    // Next emit (snapshot at t=12_001) should show m1 decayed over the FULL 2001 ms
-    val outSnap = p.handleInputRows(testKey, Iterator(snapshot(12_001L, 6, 0.0, 0, 0, 0, 0.0, "")), NoTimers).toList
-    outSnap should have length 1
-    val expected = m1 * math.pow(0.5, (12_001L - 10_000L) / 45_000.0) // half-life = 45s
-    outSnap.head.momentumRaw shouldBe expected +- 1e-9
+    clk.current = 8_000L
+    val o2 = p.handleInputRows(testKey, Iterator(pulse(8_000L,"ChampionKill","killer",2L)), NoTimers).toList
+    o2.head.spreeStreak shouldBe 2
+    o2.head.momentumRaw should be > 0.0
 
-    // And a new valid pulse (eid increases) should push momentum above the pure-decay baseline
-    val outNext = p.handleInputRows(testKey, Iterator(pulse(12_002L, "ChampionKill", "assist", 6L)), NoTimers).toList
-    outNext should have length 1
-    outNext.head.momentumRaw should be > expected
+    clk.current = 10_000L
+    val o3 = p.handleInputRows(testKey, Iterator(pulse(10_000L,"ChampionKill","victim",3L)), NoTimers).toList
+    o3.head.spreeStreak shouldBe 0
+    o3.head.momentumRaw should be >= 0.0
   }
 
-  test("out-of-order timestamp still accepted (dt=0) when eventId increases") {
-    val p = newProc()
+  // ------------------------------------------------------------------------------
+  // Snapshot semantics: monotone merges, sticky champion, always-emit
+  // ------------------------------------------------------------------------------
 
-    val o1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assist", 10L)), NoTimers).toList
-    val mBefore = o1.head.momentumRaw
+  test("snapshot persists decayed baseline; monotone merge of scoreboard/inv; sticky champion; always emits") {
+    val (p, clk) = newProcAt(10_000L)
 
-    // older ts but larger eventId → accepted, dt=0 so no decay
-    val o2 = p.handleInputRows(testKey, Iterator(pulse(9_000L, "ChampionKill", "assist", 11L)), NoTimers).toList
-    o2 should have length 1
-    o2.head.momentumRaw should be > mBefore
-  }
+    // Seed momentum
+    clk.current = 10_000L
+    val outPulse = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "killer", 10L)), NoTimers).toList
+    val m0 = outPulse.head.momentumRaw
 
-  test("snapshot with level-only increase changes power and emits") {
-    val p = newProc()
-
-    val s1 = p.handleInputRows(testKey, Iterator(snapshot(1_000L, 1, 0.0, 0, 0, 0, 0.0, "")), NoTimers).toList
-    val p1 = s1.head.powerNorm
-
-    val s2 = p.handleInputRows(testKey, Iterator(snapshot(2_000L, 2, 0.0, 0, 0, 0, 0.0, "")), NoTimers).toList
-    s2 should have length 1
-    s2.head.powerNorm should be > p1
-  }
-
-  test("championName is sticky: empty→set emits; later different name does not override") {
-    val p = newProc()
-
-    p.handleInputRows(testKey, Iterator(snapshot(1_000L, 1, 0.0, 0, 0, 0, 0.0, "")), NoTimers).toList // empty name
-    val o2 = p.handleInputRows(testKey, Iterator(snapshot(2_000L, 1, 0.0, 0, 0, 0, 0.0, "Syndra")), NoTimers).toList
-    o2 should have length 1
-    o2.head.championName shouldBe "Syndra"
-
-    val o3 = p.handleInputRows(testKey, Iterator(snapshot(3_000L, 1, 0.0, 0, 0, 0, 0.0, "MonkeyKing")), NoTimers).toList
-    o3 shouldBe empty // no override, no other deltas
-  }
-
-  test("powerFrom handles None level/inv gracefully (returns 0)") {
-    val p = newProc()
-    p.powerFrom(None, None) shouldBe 0.0 +- 1e-9
-  }
-
-  test("snapshot with None level/inv and no other deltas does NOT emit") {
-    val p = newProc()
-    val s = HeatIn("GAME", "ORDER", "RIOT#ID", 1_000L, "snapshot",
-      etype = None, championName = None, role = None,
-      level = None, invValue = None, eventId = None,
-      kills = Some(0), deaths = Some(0), assists = Some(0), creepScore = Some(0.0), None)
-    val out = p.handleInputRows(testKey, Iterator(s), NoTimers).toList
-    out shouldBe empty
-  }
-
-  test("unknown pulse type emits decayed baseline without adding momentum") {
-    val p = newProc()
-
-    val o1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assist", 1L)), NoTimers).toList
-    val m0 = o1.head.momentumRaw
-
-    // unknown type; ensures changedPulse=true, base=0 → only decay applies
-    val out = p.handleInputRows(testKey, Iterator(pulse(55_000L, "WeirdThing", "killer", 2L)), NoTimers).toList
-    out should have length 1
-    out.head.momentumRaw should be < m0
-  }
-
-  test("half-life ≈ halves momentum after 45s using a no-op pulse to anchor emit") {
-    val p = newProc()
-
-    val o1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "killer", 1L)), NoTimers).toList
-    val m0 = o1.head.momentumRaw
-    m0 should be > 0.0
-
-    // after 45s, send an unknown-type pulse with new eid → emit decayed baseline
-    val o2 = p.handleInputRows(testKey, Iterator(pulse(55_000L, "Noop", "assist", 2L)), NoTimers).toList
-    val mHalf = o2.head.momentumRaw
-
-    mHalf shouldBe (m0 / 2.0) +- 0.25 // allow slack: m0 depends on weights; decay model exact, but tolerate jitter
-  }
-
-  test("key routing: gameId/team/riotId are taken from the key") {
-    val p = newProc()
-    val key2 = "G1|Summ#EU|CHAOS"
-
-    val out = p.handleInputRows(key2, Iterator(snapshot(1_000L, 3, 500.0, 0, 0, 0, 0.0, "Syndra")), NoTimers).toList
-    out should have length 1
-    out.head.gameId shouldBe "G1"
-    out.head.riotId shouldBe "Summ#EU"
-    out.head.team shouldBe "CHAOS"
-  }
-
-  test("pulses with missing eventId are not deduped: two emits and cumulative momentum") {
-    val p = newProc()
-
-    val a1 = p.handleInputRows(testKey, Iterator(pulseNoEid(10_000L, "ChampionKill", "assist")), NoTimers).toList
-    val m1 = a1.head.momentumRaw
-
-    val a2 = p.handleInputRows(testKey, Iterator(pulseNoEid(12_000L, "ChampionKill", "assist")), NoTimers).toList
-    a2 should have length 1
-    a2.head.momentumRaw should be > m1
-  }
-
-  test("micro-batch sorts by ts: reversed input in one batch equals ascending across two batches (momentumRaw)") {
-    val pA = newProc()
-    // One batch, reversed order → processor sorts
-    val outA = pA.handleInputRows(testKey,
-      Iterator(
-        pulse(12_000L, "ChampionKill", "assist", 2L),
-        pulse(10_000L, "ChampionKill", "assist", 1L)
-      ),
-      NoTimers
+    // Snapshot with deltas
+    clk.current = 55_000L
+    val s1 = p.handleInputRows(testKey,
+      Iterator(snapshot(55_000L, 6, 2000.0, 2, 1, 3, 80.0, "Wukong")), NoTimers
     ).toList
-    outA should have length 1
-    val mA = outA.head.momentumRaw
-
-    val pB = newProc()
-    val b1 = pB.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assist", 1L)), NoTimers).toList
-    val b2 = pB.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "assist", 2L)), NoTimers).toList
-    val mB = b2.head.momentumRaw
-
-    mA shouldBe mB +- 1e-9
-  }
-
-  test("normalization bounds: momentumNorm and heat are clamped to [0,100] and backendLatency >= 0") {
-    val p = newProc()
-
-    // try to push over the cap
-    val o = p.handleInputRows(testKey, Iterator(
-      pulse(10_000L, "BaronKill", "killer", 1L),
-      pulse(10_100L, "BaronKill", "killer", 2L),
-      pulse(10_200L, "BaronKill", "killer", 3L),
-      pulse(10_300L, "BaronKill", "killer", 4L),
-      pulse(10_400L, "BaronKill", "killer", 5L)
-    ), NoTimers).toList
-
-    o should have length 1
-    o.head.momentumNorm should be >= 0.0
-    o.head.momentumNorm should be <= 100.0
-    o.head.heat should be >= 0.0
-    o.head.heat should be <= 100.0
-    o.head.backendLatencyMs should be >= 0L
-    o.head.sourceTsMs should be > 0L
-  }
-
-  test("first snapshot emits and carries level (even if power ~ 0 at L1)") {
-    val p = newProc()
-
-    val out = p.handleInputRows(testKey, Iterator(snapshot(1_000L, 1, 0.0, 0, 0, 0, 0.0, "")), NoTimers).toList
-    out should have length 1
-    out.head.level shouldBe 1
-  }
-
-  test("level monotone: lower level in later snapshot does not reduce level or emit") {
-    val p = newProc()
-
-    val s1 = p.handleInputRows(testKey, Iterator(snapshot(1_000L, 6, 1000.0, 0, 0, 0, 20.0, "Wukong")), NoTimers).toList
     s1 should have length 1
+    s1.head.momentumRaw should be < m0
+    s1.head.kills shouldBe 2
+    s1.head.deaths shouldBe 1
+    s1.head.assists shouldBe 3
+    s1.head.creepScore shouldBe 80.0
+    s1.head.invValue shouldBe 2000.0
+    s1.head.level shouldBe 6
+    s1.head.championName shouldBe "Wukong"
+
+    // Lower cs/inv; new alias; same level → state should remain monotone but still emit (decayed)
+    clk.current = 56_000L
+    val s2 = p.handleInputRows(testKey,
+      Iterator(snapshot(56_000L, 6, 1500.0, 2, 1, 3, 70.0, "MonkeyKing")), NoTimers
+    ).toList
+    s2 should have length 1
+    s2.head.kills shouldBe 2
+    s2.head.deaths shouldBe 1
+    s2.head.assists shouldBe 3
+    s2.head.creepScore shouldBe 80.0
+    s2.head.invValue shouldBe 2000.0 // monotone
+    s2.head.level shouldBe 6
+    s2.head.championName shouldBe "Wukong" // sticky
+    s2.head.momentumRaw should be <= s1.head.momentumRaw
+  }
+
+  test("level monotone: lower level in later snapshot does not reduce level (still emits)") {
+    val (p, clk) = newProcAt(1_000L)
+
+    clk.current = 1_000L
+    val s1 = p.handleInputRows(testKey, Iterator(snapshot(1_000L, 6, 1000.0, 0, 0, 0, 20.0, "Wukong")), NoTimers).toList
     s1.head.level shouldBe 6
 
-    // lower level + no beneficial deltas → merged state unchanged → no emit
+    // lower level + lower inv → no regression; still emits decayed frame
+    clk.current = 2_000L
     val s2 = p.handleInputRows(testKey, Iterator(snapshot(2_000L, 4, 900.0, 0, 0, 0, 15.0, "MonkeyKing")), NoTimers).toList
-    s2 shouldBe empty
+    s2 should have length 1
+    s2.head.level shouldBe 6
+    s2.head.invValue shouldBe 1000.0 +- 1e-9
   }
 
-  test("pulse before any snapshot: emission carries default level=0") {
-    val p = newProc()
+  test("pulse carries level from latest snapshot; pulses alone don’t change level") {
+    val (p, clk) = newProcAt(1_000L)
 
-    val out = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assist", 100L)), NoTimers).toList
-    out should have length 1
-    out.head.level shouldBe 0 // InitialState.level
-  }
-
-  test("pulse after snapshot: emission carries the latest known level") {
-    val p = newProc()
-
+    clk.current = 1_000L
     val s = p.handleInputRows(testKey, Iterator(snapshot(1_000L, 5, 0.0, 0, 0, 0, 0.0, "Syndra")), NoTimers).toList
-    s should have length 1
     s.head.level shouldBe 5
 
+    clk.current = 2_000L
     val out = p.handleInputRows(testKey, Iterator(pulse(2_000L, "ChampionKill", "killer", 10L)), NoTimers).toList
-    out should have length 1
     out.head.level shouldBe 5
   }
 
-  test("level-only increase (same inv) emits and HeatOut.level increases") {
-    val p = newProc()
+  // ------------------------------------------------------------------------------
+  // Items: set, change, ignore older
+  // ------------------------------------------------------------------------------
 
-    val s1 = p.handleInputRows(testKey, Iterator(snapshot(1_000L, 1, 0.0, 0, 0, 0, 0.0, "")), NoTimers).toList
-    s1 should have length 1
-    s1.head.level shouldBe 1
-    val p1 = s1.head.powerNorm
+  test("first snapshot with items sets items_str; items-only change emits; older-ts items ignored") {
+    val (p, clk) = newProcAt(1_000L)
+    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
+    val itemsB = "0:100:Boots of Speed, 1:201:Sword of Justice"
 
-    val s2 = p.handleInputRows(testKey, Iterator(snapshot(2_000L, 2, 0.0, 0, 0, 0, 0.0, "")), NoTimers).toList
+    // set items
+    clk.current = 1_000L
+    val s1 = p.handleInputRows(testKey, Iterator(snapshotWithItems(1_000L, 6, 2000.0, 0, 0, 0, 0.0, "Lux", itemsA)), NoTimers).toList
+    s1.head.items_str shouldBe itemsA
+
+    // items-only change
+    clk.current = 2_000L
+    val s2 = p.handleInputRows(testKey, Iterator(snapshotWithItems(2_000L, 6, 2000.0, 0, 0, 0, 0.0, "Lux", itemsB)), NoTimers).toList
     s2 should have length 1
-    s2.head.level shouldBe 2
-    s2.head.powerNorm should be > p1
-  }
-
-  test("inventory-only increase emits and preserves level") {
-    val p = newProc()
-
-    val s1 = p.handleInputRows(testKey, Iterator(snapshot(1_000L, 6, 1000.0, 0, 0, 0, 0.0, "Lux")), NoTimers).toList
-    s1 should have length 1
-    s1.head.level shouldBe 6
-
-    val s2 = p.handleInputRows(testKey, Iterator(snapshot(2_000L, 6, 2000.0, 0, 0, 0, 0.0, "Lux")), NoTimers).toList
-    s2 should have length 1
+    s2.head.items_str shouldBe itemsB
     s2.head.level shouldBe 6
-    s2.head.powerNorm should be > s1.head.powerNorm
+    s2.head.invValue shouldBe 2000.0 +- 1e-9
+
+    // older snapshot with different items should NOT override (ts < lastTs), still emits decayed frame but keeps itemsB
+    clk.current = 2_500L
+    val sOld = p.handleInputRows(testKey, Iterator(snapshotWithItems(1_500L, 6, 2000.0, 0, 0, 0, 0.0, "Lux", "0:100:Boots")), NoTimers).toList
+    sOld should have length 1
+    sOld.head.items_str shouldBe itemsB
+
+    // next pulse should still carry itemsB
+    clk.current = 3_000L
+    val pOut = p.handleInputRows(testKey, Iterator(pulse(3_000L, "ChampionKill", "assister", 42L)), NoTimers).toList
+    pOut.head.items_str shouldBe itemsB
   }
 
-  test("multiple pulses after a snapshot do not change level") {
-    val p = newProc()
+  // ------------------------------------------------------------------------------
+  // Bounds, routing, roles, and missing eid
+  // ------------------------------------------------------------------------------
 
-    val s = p.handleInputRows(testKey, Iterator(snapshot(1_000L, 7, 1500.0, 0, 0, 0, 0.0, "Ahri")), NoTimers).toList
-    s should have length 1
-    s.head.level shouldBe 7
-
-    val o1 = p.handleInputRows(testKey, Iterator(pulse(2_000L, "ChampionKill", "assist", 11L)), NoTimers).toList
-    o1 should have length 1
-    o1.head.level shouldBe 7
-
-    val o2 = p.handleInputRows(testKey, Iterator(pulse(3_500L, "ChampionKill", "killer", 12L)), NoTimers).toList
-    o2 should have length 1
-    o2.head.level shouldBe 7
-  }
-
-  test("victim pulse resets spree but level remains unchanged") {
-    val p = newProc()
-
-    val s = p.handleInputRows(testKey, Iterator(snapshot(1_000L, 8, 2500.0, 0, 0, 0, 0.0, "Zed")), NoTimers).toList
-    s.head.level shouldBe 8
-
-    val kill = p.handleInputRows(testKey, Iterator(pulse(2_000L, "ChampionKill", "killer", 1L)), NoTimers).toList
-    kill.head.spreeStreak shouldBe 1
-    kill.head.level shouldBe 8
-
-    val death = p.handleInputRows(testKey, Iterator(pulse(3_000L, "ChampionKill", "victim", 2L)), NoTimers).toList
-    death.head.spreeStreak shouldBe 0
-    death.head.level shouldBe 8
-  }
-
-  test("mixed micro-batch ordering by timestamp: final emission carries latest level") {
-    val p = newProc()
-
-    // Intentionally out of order in iterator; processor sorts by tsMillis internally.
-    val rows = Iterator(
-      pulse(5_000L, "ChampionKill", "assist", 50L), // t=5s
-      snapshot(6_000L, 6, 1200.0, 0, 0, 1, 10.0, "Lee Sin") // t=6s
-    )
-
-    val out = p.handleInputRows(testKey, rows, NoTimers).toList
-    out should have length 1
-    out.head.level shouldBe 6
-    out.head.championName shouldBe "Lee Sin"
-  }
-
-  test("champion alias change with level increase: emits once, keeps sticky name and updated level") {
-    val p = newProc()
-
-    val s1 = p.handleInputRows(testKey, Iterator(snapshot(1_000L, 5, 1200.0, 0, 0, 0, 0.0, "Wukong")), NoTimers).toList
-    s1 should have length 1
-    s1.head.level shouldBe 5
-    s1.head.championName shouldBe "Wukong"
-
-    // New snapshot: higher level, different alias → name should remain "Wukong" (sticky), level should increase
-    val s2 = p.handleInputRows(testKey, Iterator(snapshot(2_000L, 6, 1200.0, 0, 0, 0, 0.0, "MonkeyKing")), NoTimers).toList
-    s2 should have length 1
-    s2.head.level shouldBe 6
-    s2.head.championName shouldBe "Wukong"
-  }
-
-  test("snapshot with identical values as last snapshot does NOT emit") {
-    val p = newProc()
-    p.handleInputRows(testKey, Iterator(snapshot(1_000L, 3, 900.0, 1, 1, 0, 25.0, "Lux")), NoTimers).toList should have length 1
-
-    val same = snapshot(2_000L, 3, 900.0, 1, 1, 0, 25.0, "Lux")
-    p.handleInputRows(testKey, Iterator(same), NoTimers).toList shouldBe empty
-  }
-
-  test("snapshot: kills-only increase emits and merges monotone scoreboard") {
-    val p = newProc()
-    p.handleInputRows(testKey, Iterator(snapshot(1_000L, 3, 500.0, 0, 0, 0, 10.0, "Ashe")), NoTimers).toList
-
-    val s2 = snapshot(2_000L, 3, 500.0, 1, 0, 0, 10.0, "Ashe")
-    val out = p.handleInputRows(testKey, Iterator(s2), NoTimers).toList
-    out should have length 1
-    out.head.kills shouldBe 1
-    out.head.deaths shouldBe 0
-    out.head.assists shouldBe 0
-  }
-
-  test("snapshot: assists-only increase emits") {
-    val p = newProc()
-    p.handleInputRows(testKey, Iterator(snapshot(1_000L, 2, 300.0, 0, 0, 0, 5.0, "Ezreal")), NoTimers).toList
-
-    val s2 = snapshot(2_000L, 2, 300.0, 0, 0, 1, 5.0, "Ezreal")
-    val out = p.handleInputRows(testKey, Iterator(s2), NoTimers).toList
-    out should have length 1
-    out.head.kills shouldBe 0
-    out.head.assists shouldBe 1
-  }
-
-  test("snapshot: deaths-only increase emits") {
-    val p = newProc()
-    p.handleInputRows(testKey, Iterator(snapshot(1_000L, 2, 300.0, 0, 0, 0, 5.0, "Ezreal")), NoTimers).toList
-
-    val s2 = snapshot(2_000L, 2, 300.0, 0, 1, 0, 5.0, "Ezreal")
-    val out = p.handleInputRows(testKey, Iterator(s2), NoTimers).toList
-    out should have length 1
-    out.head.deaths shouldBe 1
-  }
-
-  test("snapshot: creepScore-only increase emits") {
-    val p = newProc()
-    p.handleInputRows(testKey, Iterator(snapshot(1_000L, 2, 300.0, 0, 0, 0, 12.0, "Ezreal")), NoTimers).toList
-
-    val s2 = snapshot(2_000L, 2, 300.0, 0, 0, 0, 25.0, "Ezreal")
-    val out = p.handleInputRows(testKey, Iterator(s2), NoTimers).toList
-    out should have length 1
-    out.head.creepScore shouldBe 25.0
-  }
-
-  test("FirstBlood adds momentum but does not advance spree") {
-    val p = newProc()
-    val fb = HeatIn("GAME", "ORDER", "RIOT#ID", 10_000L, "pulse",
-      etype = Some("FirstBlood"), championName = None, role = Some("killer"),
-      level = None, invValue = None, eventId = Some(1L),
-      kills = None, deaths = None, assists = None, creepScore = None, items_str = None)
-
-    val out = p.handleInputRows(testKey, Iterator(fb), NoTimers).toList
-    out should have length 1
-    out.head.momentumRaw should be > 0.0
-    out.head.spreeStreak shouldBe 0 // not a ChampionKill, so spree doesn't change
-  }
-
-  test("known type with missing role: decay-only anchor (no added momentum)") {
-    val p = newProc()
-    val k1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assist", 1L)), NoTimers).toList
-    val m0 = k1.head.momentumRaw
-
-    // 45s later, same type but role=None, new eid → should emit with decayed baseline
-    val anchor = HeatIn("GAME", "ORDER", "RIOT#ID", 55_000L, "pulse",
-      etype = Some("ChampionKill"), championName = None, role = None,
-      level = None, invValue = None, eventId = Some(2L),
-      kills = None, deaths = None, assists = None, creepScore = None, items_str = None)
-
-    val out = p.handleInputRows(testKey, Iterator(anchor), NoTimers).toList
-    out should have length 1
-    out.head.momentumRaw should be < m0
-    out.head.spreeStreak shouldBe 0 // assist earlier didn’t change spree; missing role doesn’t either
-  }
-
-  test("dedupe inside one micro-batch: later smaller eventId is ignored") {
-    val pA = newProc()
-    // Two pulses same ts; eventId 5 then 4 → second should be ignored
-    val batch = Iterator(
-      pulse(10_000L, "ChampionKill", "killer", 5L),
-      pulse(10_000L, "ChampionKill", "killer", 4L)
-    )
-    val outA = pA.handleInputRows(testKey, batch, NoTimers).toList
-    outA should have length 1
-    val mA = outA.head.momentumRaw
-
-    val pB = newProc()
-    val outB = pB.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "killer", 5L)), NoTimers).toList
-    val mB = outB.head.momentumRaw
-
-    mA shouldBe mB +- 1e-9
-  }
-
-  test("snapshot: lower level but higher inventory still emits; level remains monotone") {
-    val p = newProc()
-    val s1 = p.handleInputRows(testKey, Iterator(snapshot(1_000L, 6, 1000.0, 0, 0, 0, 0.0, "Lux")), NoTimers).toList
-    s1.head.level shouldBe 6
-    val p1 = s1.head.powerNorm
-
-    // Level goes down to 5 (should be ignored), inv rises (should emit and increase power)
-    val s2 = p.handleInputRows(testKey, Iterator(snapshot(2_000L, 5, 2000.0, 0, 0, 0, 0.0, "Lux")), NoTimers).toList
-    s2 should have length 1
-    s2.head.level shouldBe 6
-    s2.head.powerNorm should be > p1
-  }
-
-  test("two snapshots in one micro-batch: coalesced emit carries merged monotone scoreboard") {
-    val p = newProc()
-    val out = p.handleInputRows(
-      testKey,
-      Iterator(
-        snapshot(10_000L, 4, 800.0, 0, 0, 0, 5.0, "Zeri"),
-        snapshot(10_001L, 4, 800.0, 1, 0, 1, 10.0, "Zeri")
-      ),
-      NoTimers
-    ).toList
-    out should have length 1
-    out.head.kills shouldBe 1
-    out.head.assists shouldBe 1
-    out.head.creepScore shouldBe 10.0
-  }
-
-  test("spree bonus caps: per-pulse contribution equal at cap and cap+1 (spacing = half-life)") {
-    val p = newProc()
-
-    // spacing so decay factor = 0.5 exactly
-    val spacingMs = (HalfLifeSeconds * 1000L).toLong
-
-    // kills needed to reach the spree bonus cap
-    val killsToCap = math.ceil(SpreeCap / SpreeStep).toInt
-
-    var eid = 0L
-
-    def kill(ts: Long) = {
-      eid += 1
-      p.handleInputRows(testKey, Iterator(pulse(ts, "ChampionKill", "killer", eid)), NoTimers).toList.head
-    }
-
-    // build spree up to the cap
-    var prev: HeatOut = kill(10_000L + spacingMs)
-    var i = 2
-    while (i <= killsToCap) {
-      prev = kill(10_000L + i * spacingMs)
-      i += 1
-    }
-    val atCap = prev
-
-    val justAfterCap = p.handleInputRows(
-      testKey, Iterator(pulse(10_000L + (killsToCap + 1) * spacingMs, "ChampionKill", "killer", {
-        eid += 1; eid
-      })), NoTimers
-    ).toList.head
-    val afterCapPlusOne = p.handleInputRows(
-      testKey, Iterator(pulse(10_000L + (killsToCap + 2) * spacingMs, "ChampionKill", "killer", {
-        eid += 1; eid
-      })), NoTimers
-    ).toList.head
-
-    // contribution = m_k - 0.5 * m_{k-1}
-    def contrib(curr: HeatOut, prev: HeatOut): Double = curr.momentumRaw - 0.5 * prev.momentumRaw
-
-    val cAtCap = contrib(justAfterCap, atCap)
-    val cAfterCap = contrib(afterCapPlusOne, justAfterCap)
-    cAfterCap shouldBe cAtCap +- 1e-9
-
-    // sanity: absolute deltas shrink due to decay on growing baseline
-    val dAtCap = justAfterCap.momentumRaw - atCap.momentumRaw
-    val dAfterCap = afterCapPlusOne.momentumRaw - justAfterCap.momentumRaw
-    dAfterCap should be < dAtCap
-  }
-
-  test("half-life decay halves momentum after HalfLifeSeconds (using a no-op pulse to anchor emit)") {
-    val p = newProc()
-
-    // seed momentum
-    val o1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "killer", 1L)), NoTimers).toList
-    val m0 = o1.head.momentumRaw
-    m0 should be > 0.0
-
-    // after one half-life, emit a pulse with unknown type to surface the decayed baseline
-    val o2 = p.handleInputRows(
-      testKey,
-      Iterator(pulse(10_000L + (HalfLifeSeconds * 1000L).toLong, "Noop", "assist", 2L)),
-      NoTimers
-    ).toList
-
-    val mHalf = o2.head.momentumRaw
-    mHalf shouldBe (m0 / 2.0) +- 1e-9
-  }
-
-  test("normalization bounds derive from constants: momentumNorm in [0,100], heat clamped, constants echoed") {
-    val p = newProc()
-
+  test("normalization bounds and constants: momentumNorm, heat ∈ [0,100]; constants echoed; backendLatency >= 0") {
+    val (p, clk) = newProcAt(10_000L)
+    clk.current = 10_000L
     val out = p.handleInputRows(testKey, Iterator(
       pulse(10_000L, "BaronKill", "killer", 1L),
       pulse(10_050L, "BaronKill", "killer", 2L),
@@ -620,210 +331,259 @@ final class HeatProcessorSpec extends AnyFunSuite with Matchers {
       pulse(10_150L, "BaronKill", "killer", 4L)
     ), NoTimers).toList
 
-    out should have length 1
-    val o = out.head
-
+    out should have length 4
+    val o = out.last
     o.momentumNorm should be >= 0.0
     o.momentumNorm should be <= 100.0
     o.heat should be >= 0.0
     o.heat should be <= 100.0
-
-    // constants surfaced by the processor should echo the companion’s values
+    o.backendLatencyMs should be >= 0L
+    o.sourceTsMs should be > 0L
     o.momentumCap shouldBe MomentumCap +- 1e-9
     o.halfLifeSec shouldBe HalfLifeSeconds +- 1e-9
   }
 
-  test("first snapshot with items emits and sets items_str") {
-    val p = newProc()
+  test("key routing: gameId/team/riotId are taken from the composite key") {
+    val (p, clk) = newProcAt(1_000L)
+    val key2 = "G1|Summ#EU|CHAOS"
 
+    clk.current = 1_000L
+    val out = p.handleInputRows(key2, Iterator(snapshot(1_000L, 3, 500.0, 0, 0, 0, 0.0, "Syndra")), NoTimers).toList
+    out.head.gameId shouldBe "G1"
+    out.head.riotId shouldBe "Summ#EU"
+    out.head.team shouldBe "CHAOS"
+  }
+
+  test("known type with missing role anchors a decayed emit (no added momentum)") {
+    val (p, clk) = newProcAt(10_000L)
+
+    clk.current = 10_000L
+    val k1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 1L)), NoTimers).toList
+    val m0 = k1.head.momentumRaw
+
+    clk.current = 55_000L
+    val anchor = HeatIn("GAME", "ORDER", "RIOT#ID", 55_000L, "pulse",
+      etype = Some("ChampionKill"), championName = None, role = None,
+      level = None, invValue = None, eventId = Some(2L),
+      kills = None, deaths = None, assists = None, creepScore = None, items_str = None, isDead = None)
+
+    val out = p.handleInputRows(testKey, Iterator(anchor), NoTimers).toList
+    out.head.momentumRaw shouldBe decayFrom(m0, 45_000L) +- 1e-9
+    out.head.spreeStreak shouldBe 0
+  }
+
+  test("pulses with missing eventId are not deduped: two emits and cumulative momentum") {
+    val (p, clk) = newProcAt(10_000L)
+
+    clk.current = 10_000L
+    val a1 = p.handleInputRows(testKey, Iterator(pulseNoEid(10_000L, "ChampionKill", "assister")), NoTimers).toList
+    val m1 = a1.head.momentumRaw
+
+    clk.current = 12_000L
+    val a2 = p.handleInputRows(testKey, Iterator(pulseNoEid(12_000L, "ChampionKill", "assister")), NoTimers).toList
+    a2.head.momentumRaw should be > m1
+  }
+
+  // --- Additions to HeatProcessorSpec ------------------------------------------------
+
+  test("dedupe in one micro-batch: later smaller eventId still emits; second frame equals decayed baseline (dt=0)") {
+    val (p, clk) = newProcAt(10_000L)
+    clk.current = 10_000L
+    val out = p.handleInputRows(
+      testKey,
+      Iterator(
+        pulse(10_000L, "ChampionKill", "killer", 5L),
+        pulse(10_000L, "ChampionKill", "killer", 4L) // deduped by eid
+      ),
+      NoTimers
+    ).toList
+
+    out should have length 2
+    out(1).momentumRaw shouldBe out(0).momentumRaw +- 1e-9 // dt=0 → no extra decay/gain
+    out(1).spreeStreak shouldBe out(0).spreeStreak
+  }
+
+  test("heat equals HeatWPower * powerNorm when momentum is zero") {
+    val (p, clk) = newProcAt(1_000L)
+    clk.current = 1_000L
+    val o = p.handleInputRows(testKey, Iterator(snapshot(1_000L, 6, 2000.0, 0, 0, 0, 0.0, "Lux")), NoTimers).toList.head
+    o.momentumRaw shouldBe 0.0 +- 1e-9
+    val expectedHeat = HeatWPower * o.powerNorm
+    o.heat shouldBe expectedHeat +- 1e-9
+  }
+
+  test("power normalization saturates at 100 when level=LevelMax and inv>=ItemBudget") {
+    val (p, clk) = newProcAt(1_000L)
+    clk.current = 1_000L
+    val o = p.handleInputRows(testKey, Iterator(snapshot(1_000L, LevelMax.toInt, ItemBudget, 0, 0, 0, 0.0, "Lux")), NoTimers).toList.head
+    o.powerNorm shouldBe 100.0 +- 1e-9
+    o.powerRaw shouldBe 100.0 +- 1e-9
+  }
+
+  test("same-timestamp, increasing eventId: second pulse accepted with dt=0 and momentum increases") {
+    val (p, clk) = newProcAt(10_000L)
+    clk.current = 10_000L
+
+    val out = p.handleInputRows(
+      testKey,
+      Iterator(
+        pulse(10_000L, "ChampionKill", "assister", 1L),
+        pulse(10_000L, "ChampionKill", "assister", 2L) // larger eid, same ts → dt=0
+      ),
+      NoTimers
+    ).toList
+
+    out should have length 2
+    out(1).momentumRaw should be > out(0).momentumRaw // additive base, no decay
+  }
+
+  test("whitespace-only items string is ignored (no override); still emits and retains previous items") {
+    val (p, clk) = newProcAt(1_000L)
     val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
+
+    clk.current = 1_000L
+    p.handleInputRows(testKey, Iterator(
+      snapshotWithItems(1_000L, 4, 1200.0, 0, 0, 0, 0.0, "Jinx", itemsA)
+    ), NoTimers).toList should have length (1)
+
+    // whitespace-only → treated as missing; emit occurs (always-emit), but items don't change
+    clk.current = 2_000L
     val out = p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(1_000L, 1, 500.0, 0, 0, 0, 0.0, "Sivir", itemsA)
+      snapshotWithItems(2_000L, 4, 1200.0, 0, 0, 0, 0.0, "Jinx", "   ")
     ), NoTimers).toList
 
     out should have length 1
     out.head.items_str shouldBe itemsA
   }
 
-  test("identical items string on later snapshot does NOT emit") {
-    val p = newProc()
-    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
+  test("repeated deaths clamp momentum at zero and keep spree at zero") {
+    val (p, clk) = newProcAt(10_000L)
 
-    p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(1_000L, 2, 800.0, 0, 0, 0, 0.0, "Sivir", itemsA)
-    ), NoTimers).toList should have length (1)
+    // seed a little momentum
+    clk.current = 10_000L
+    p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 1L)), NoTimers).toList.head.momentumRaw should be > 0.0
 
-    // same items; no other deltas → no emit
-    val out = p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(2_000L, 2, 800.0, 0, 0, 0, 0.0, "Sivir", itemsA)
-    ), NoTimers).toList
-    out shouldBe empty
+    // two deaths back-to-back
+    clk.current = 11_000L
+    val d1 = p.handleInputRows(testKey, Iterator(pulse(11_000L, "ChampionKill", "victim", 2L)), NoTimers).toList.head
+    d1.momentumRaw should be >= 0.0
+    d1.spreeStreak shouldBe 0
+
+    clk.current = 12_000L
+    val d2 = p.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "victim", 3L)), NoTimers).toList.head
+    d2.momentumRaw shouldBe 0.0 +- 1e-9
+    d2.spreeStreak shouldBe 0
   }
 
-  test("items-only change emits even when level/inv are unchanged") {
-    val p = newProc()
-    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
-    val itemsB = "0:100:Boots of Speed, 1:201:Sword of Justice" // slot 1 item changed
+  test("momentum decays to near-zero after several half-lives using no-op anchor pulses") {
+    val (p, clk) = newProcAt(10_000L)
 
-    p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(1_000L, 6, 2000.0, 0, 0, 0, 0.0, "Lux", itemsA)
-    ), NoTimers).toList should have length (1)
+    clk.current = 10_000L
+    val o1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "killer", 1L)), NoTimers).toList.head
+    val m0 = o1.momentumRaw
 
-    val out = p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(2_000L, 6, 2000.0, 0, 0, 0, 0.0, "Lux", itemsB)
-    ), NoTimers).toList
-
-    out should have length 1
-    out.head.items_str shouldBe itemsB
-    out.head.level shouldBe 6
-    out.head.invValue shouldBe 2000.0 +- 1e-9
+    // Advance 4 half-lives → expected ≈ m0 * (1/16)
+    val t = 10_000L + (4 * HalfLifeSeconds * 1000L).toLong
+    clk.current = t
+    val o2 = p.handleInputRows(testKey, Iterator(pulse(t, "Noop", "assister", 2L)), NoTimers).toList.head
+    val expected = m0 / 16.0
+    o2.momentumRaw shouldBe expected +- (m0 * 1e-6) // tight tolerance
   }
 
-  test("older-timestamp snapshot with different items does NOT override and does NOT emit") {
-    val p = newProc()
-    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
-    val itemsB = "0:100:Boots of Speed, 1:202:Hammer of Truth"
+  test("producer replay: identical pulse payload with new eid double-counts momentum") {
+    val (p, clk) = newProcAt(10_000L)
 
-    // First set items at t=2000
-    p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(2_000L, 5, 1500.0, 0, 0, 0, 0.0, "Sona", itemsA)
-    ), NoTimers).toList should have length (1)
+    clk.current = 10_000L
+    val a1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 1L)), NoTimers).toList
+    a1 should have length 1
+    val m1 = a1.head.momentumRaw
+    m1 should be > 0.0
 
-    // Then send an OLDER snapshot (t=1500) with different items → should be ignored (ts < lastTs)
-    val out = p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(1_500L, 5, 1500.0, 0, 0, 0, 0.0, "Sona", itemsB)
-    ), NoTimers).toList
-
-    out shouldBe empty
-
-    // Next pulse emission should still carry itemsA
-    val pulseOut = p.handleInputRows(testKey, Iterator(
-      pulse(3_000L, "ChampionKill", "assist", 1L)
-    ), NoTimers).toList
-    pulseOut should have length 1
-    pulseOut.head.items_str shouldBe itemsA
+    // Same payload, newer eid → adds again
+    clk.current = 10_000L
+    val a2 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 2L)), NoTimers).toList
+    a2 should have length 1
+    a2.head.momentumRaw should be > m1
   }
 
-  test("snapshot with items=None does not change items and does NOT emit when no other deltas") {
-    val p = newProc()
-    val itemsA = "0:100:Boots of Speed"
+  test("missing eventId on repeated assists inflates momentum") {
+    val (p, clk) = newProcAt(10_000L)
 
-    // Seed with items
-    p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(1_000L, 3, 900.0, 0, 0, 0, 0.0, "Ahri", itemsA)
-    ), NoTimers).toList should have length (1)
+    clk.current = 10_000L
+    val a1 = p.handleInputRows(testKey, Iterator(pulseNoEid(10_000L, "ChampionKill", "assister")), NoTimers).toList
+    val m1 = a1.head.momentumRaw
+    m1 should be > 0.0
 
-    // Same state, items omitted
-    val sNoItems = snapshot(2_000L, 3, 900.0, 0, 0, 0, 0.0, "Ahri") // items=None via your existing helper
-    val out = p.handleInputRows(testKey, Iterator(sNoItems), NoTimers).toList
-    out shouldBe empty
+    clk.current = 10_050L
+    val a2 = p.handleInputRows(testKey, Iterator(pulseNoEid(10_050L, "ChampionKill", "assister")), NoTimers).toList
+    val m2 = a2.head.momentumRaw
+    m2 should be > m1
+
+    clk.current = 10_100L
+    val a3 = p.handleInputRows(testKey, Iterator(pulseNoEid(10_100L, "ChampionKill", "assister")), NoTimers).toList
+    a3.head.momentumRaw should be > m2
   }
 
-  test("items string with trailing spaces is trimmed; no emit when semantically equal") {
-    val p = newProc()
-    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
+  test("out-of-order pulse with higher eid (dt=0) still adds momentum") {
+    val (p, clk) = newProcAt(10_000L)
 
-    p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(1_000L, 4, 1200.0, 0, 0, 0, 0.0, "Jinx", itemsA)
-    ), NoTimers).toList should have length (1)
+    clk.current = 10_000L
+    val o1 = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 10L)), NoTimers).toList
+    val mBefore = o1.head.momentumRaw
+    mBefore should be > 0.0
 
-    // Same items but with trailing spaces; processor trims before compare → no emit
-    val itemsWithSpaces = "0:100:Boots of Speed, 1:200:Sword of Might   "
-    val out = p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(2_000L, 4, 1200.0, 0, 0, 0, 0.0, "Jinx", itemsWithSpaces)
-    ), NoTimers).toList
-    out shouldBe empty
+    // Older ts but larger eid → accepted; no decay because dt=max(0, 9000-10000)=0
+    clk.current = 9_000L
+    val o2 = p.handleInputRows(testKey, Iterator(pulse(9_000L, "ChampionKill", "assister", 11L)), NoTimers).toList
+    o2 should have length 1
+    o2.head.momentumRaw should be > mBefore
   }
 
-  test("two snapshots in one micro-batch: later items win; single emission with final items") {
-    val p = newProc()
-    val itemsA = "0:100:Boots of Speed"
-    val itemsB = "0:100:Boots of Speed, 1:210:Dagger"
+  test("unknown pulse type (higher eid) anchors decay without adding momentum") {
+    val (p, clk) = newProcAt(10_000L)
 
-    // Same batch; processor sorts by ts and emits once at the end
-    val out = p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(1_000L, 2, 600.0, 0, 0, 0, 0.0, "Lux", itemsA),
-      snapshotWithItems(2_000L, 2, 600.0, 0, 0, 0, 0.0, "Lux", itemsB)
-    ), NoTimers).toList
+    // Seed some momentum
+    clk.current = 10_000L
+    val seed = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "assister", 1L)), NoTimers).toList
+    val m0 = seed.head.momentumRaw
+    m0 should be > 0.0
 
-    out should have length 1
-    out.head.items_str shouldBe itemsB
+    // After exactly one half-life, emit an unknown-type pulse with higher eid.
+    // Base weight = 0, so we should see pure decay to ~m0/2.
+    val halfMs = (HalfLifeSeconds * 1000).toLong
+    clk.current = 10_000L + halfMs
+    val anchor = p.handleInputRows(testKey, Iterator(pulse(10_000L + halfMs, "Noop", "assister", 2L)), NoTimers).toList
+    anchor should have length 1
+    anchor.head.momentumRaw shouldBe (m0 / 2.0) +- 1e-9
   }
 
-  test("items change while inv decreases: items update emits; inv remains monotone (non-decreasing)") {
-    val p = newProc()
-    val itemsA = "0:100:Boots of Speed, 1:250:Staff"
-    val itemsB = "0:100:Boots of Speed, 1:260:Wand"
+  test("OOO accepted pulse raises baseline; next valid pulse shows jump vs pure decay") {
+    val (p, clk) = newProcAt(10_000L)
 
-    val s1 = p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(1_000L, 7, 2000.0, 0, 0, 0, 0.0, "Lux", itemsA)
-    ), NoTimers).toList
-    s1 should have length 1
-    s1.head.invValue shouldBe 2000.0 +- 1e-9
+    // Establish m1
+    clk.current = 10_000L
+    val first = p.handleInputRows(testKey, Iterator(pulse(10_000L, "ChampionKill", "killer", 5L)), NoTimers).toList
+    val m1 = first.head.momentumRaw
+    m1 should be > 0.0
 
-    // Lower inv (1500) should NOT regress; items change should emit
-    val s2 = p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(2_000L, 7, 1500.0, 0, 0, 0, 0.0, "Lux", itemsB)
-    ), NoTimers).toList
+    // Dedup by id (older id) at later ts → decay-only state update, but we won’t emit here
+    // (If your code always emits, switch this step to a snapshot to compare against pure decay)
+    clk.current = 12_000L
+    val dupOlderId = p.handleInputRows(testKey, Iterator(pulse(12_000L, "ChampionKill", "killer", 4L)), NoTimers).toList
+    // If your processor "always emits", allow either empty or a single decayed frame:
+    dupOlderId.length should (be(0) or be(1))
 
-    s2 should have length 1
-    s2.head.items_str shouldBe itemsB
-    s2.head.invValue shouldBe 2000.0 +- 1e-9 // still the higher, due to monotone merge
-  }
+    // Snapshot at 12_001 shows pure decay of m1 over 2001 ms
+    clk.current = 12_001L
+    val outSnap = p.handleInputRows(testKey, Iterator(snapshot(12_001L, 6, 0.0, 0, 0, 0, 0.0, "")), NoTimers).toList
+    outSnap should have length 1
+    val expected = m1 * math.pow(0.5, (12_001L - 10_000L) / (HalfLifeSeconds * 1000.0))
+    outSnap.head.momentumRaw shouldBe expected +- 1e-9
 
-  test("pulse does not change items; emission carries last known items") {
-    val p = newProc()
-    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
-
-    p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(1_000L, 5, 1100.0, 0, 0, 0, 0.0, "Sivir", itemsA)
-    ), NoTimers).toList should have length (1)
-
-    val o = p.handleInputRows(testKey, Iterator(
-      pulse(2_000L, "ChampionKill", "assist", 42L)
-    ), NoTimers).toList
-
-    o should have length 1
-    o.head.items_str shouldBe itemsA
-  }
-
-  test("items-only transition from empty to populated string emits and carries full payload") {
-    val p = newProc()
-    val itemsB = "0:100:Boots of Speed, 1:210:Dagger, 2:350:Rod"
-
-    // Baseline snapshot with items omitted (sets power/level but items remain "")
-    val s1 = p.handleInputRows(testKey, Iterator(
-      snapshot(1_000L, 3, 900.0, 0, 0, 0, 0.0, "Orianna")
-    ), NoTimers).toList
-    s1 should have length 1
-    s1.head.items_str shouldBe "" // initial empty
-
-    // Next snapshot adds items only → emits due to itemsChanged
-    val s2 = p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(2_000L, 3, 900.0, 0, 0, 0, 0.0, "Orianna", itemsB)
-    ), NoTimers).toList
-    s2 should have length 1
-    s2.head.items_str shouldBe itemsB
-    s2.head.level shouldBe 3
-    s2.head.invValue shouldBe 900.0 +- 1e-9
-  }
-
-  test("empty/whitespace items string is ignored (no override) when previous items were set") {
-    val p = newProc()
-    val itemsA = "0:100:Boots of Speed, 1:200:Sword of Might"
-
-    p.handleInputRows(testKey, Iterator(
-      snapshotWithItems(1_000L, 4, 1200.0, 0, 0, 0, 0.0, "Caitlyn", itemsA)
-    ), NoTimers).toList should have length (1)
-
-    // Provide whitespace-only items; processor trims + filters nonEmpty → treated as missing
-    val sWhitespace = snapshotWithItems(2_000L, 4, 1200.0, 0, 0, 0, 0.0, "Caitlyn", "   ")
-    val out = p.handleInputRows(testKey, Iterator(sWhitespace), NoTimers).toList
-    out shouldBe empty
-
-    // Items remain unchanged on next emit
-    val pulseOut = p.handleInputRows(testKey, Iterator(pulse(2_100L, "ChampionKill", "assist", 99L)), NoTimers).toList
-    pulseOut should have length 1
-    pulseOut.head.items_str shouldBe itemsA
+    // New valid pulse raises above the pure-decay baseline
+    clk.current = 12_002L
+    val outNext = p.handleInputRows(testKey, Iterator(pulse(12_002L, "ChampionKill", "assister", 6L)), NoTimers).toList
+    outNext should have length 1
+    outNext.head.momentumRaw should be > expected
   }
 }

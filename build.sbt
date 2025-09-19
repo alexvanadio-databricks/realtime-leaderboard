@@ -3,8 +3,8 @@
 scalaVersion := "2.13.16"
 
 name := "realtime-leaderboard"
-organization := "com.examples"
-version := "0.1"
+organization := "demo.heat"
+version := "1.0.0"
 
 libraryDependencies += "com.databricks" %% "databricks-connect" % "17.1.+"
 libraryDependencies += "org.slf4j" % "slf4j-simple" % "2.0.16"

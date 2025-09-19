@@ -1,109 +1,12 @@
-// NOTE: we need this until because of some messy Databricks internals and wrappers. 
-// It would be better to move this entire notebook to normal source code and then make a jar
 package demo.heat
 
-import demo.heat.HeatProcessor.InitialState
 import org.apache.spark.sql.Encoders
 import org.apache.spark.sql.streaming._
-
-// input to TWS after your select into a single stream
-case class HeatIn(
-                   gameId: String,
-                   team: String,
-                   riotId: String,
-                   tsMillis: Long,
-                   kind: String, // "snapshot" | "pulse"
-                   etype: Option[String], // pulses only: "ChampionKill", "DragonKill", ...
-                   championName: Option[String],
-                   role: Option[String], // pulses only: "killer" | "assist" | "victim"
-                   level: Option[Int], // snapshots only
-                   invValue: Option[Double], // snapshots only (already computed upstream)
-                   eventId: Option[Long], // pulses may have this
-                   kills: Option[Int],
-                   deaths: Option[Int],
-                   assists: Option[Int],
-                   creepScore: Option[Double],
-                   items_str: Option[String] // string encoded items in the format "[slot]:[itemId]:[displayName], again, .."
-                 )
-
-case class HeatState(
-                      p: Double, // smoothed power 0..100
-                      m: Double, // momentum accumulator (>=0)
-                      lastTs: Long,
-                      lastEventId: Long, // minimal per-key dedupe
-
-                      // bonuses state
-                      spreeStreak: Int, // consecutive kills since last death
-
-                      kills: Int,
-                      deaths: Int,
-                      assists: Int,
-                      creepScore: Double,
-
-                      invValue: Double,
-                      championName: String,
-                      level: Int,
-                      items_str: String
-                    )
-
-/** Single event emitted by TWS for the FE to render Heat with low latency.
- * Contains enough state + constants for client-side projection/decay between pulses.
- */
-case class HeatOut(
-                    gameId: String, // Game/session identifier; partitions state and joins with other data
-                    team: String,
-                    riotId: String, // Player identifier within the game; the second part of the key
-                    championName: String,
-                    emitTsMs: Long, // Server-side epoch ms when this record was emitted (anchor for FE projection)
-                    powerRaw: Double, // Power at emit time, normalized to [0..100] (from level/items)
-                    momentumRaw: Double, // Momentum accumulator at emit time (raw/unbounded, pre-normalization)
-                    powerNorm: Double,
-                    momentumNorm: Double,
-                    heat: Double,
-
-                    // bonuses state
-                    spreeStreak: Int, // consecutive kills since last death
-
-                    // scores
-                    kills: Int,
-                    deaths: Int,
-                    assists: Int,
-                    creepScore: Double,
-
-                    invValue: Double,
-                    items_str: String,
-                    level: Int,
-
-                    // ---- constants the FE needs (kept in payload for transparency/versioning) ----
-                    halfLifeSec: Double, // Momentum half-life in seconds for exponential decay on FE
-                    momentumCap: Double,
-                    heatWPower: Double, // Weight of Power in Heat: heat = p*heatWPower + momentumNorm*heatWMomentum
-                    heatWMomentum: Double, // Weight of normalized Momentum in Heat
-                    itemBudget: Double, // “Full build” gold used to normalize inventory value to [0..100]
-                    levelMax: Double, // Max champion level used to normalize level to [0..100]
-
-                    // ---- provenance & latency ----
-                    sourceTsMs: Long, // Epoch ms of the input record that produced this output (producer timestamp)
-                    backendLatencyMs: Long // (emitTsMs - sourceTsMs), clamped to >= 0; backend processing latency only
-                  )
-
-/** Minimal state accessor the processor uses instead of directly touching Spark ValueState. */
-trait HeatStateStore {
-  def get(): HeatState
-  def update(s: HeatState): Unit
-}
-
-/** Simple in-memory store for unit tests. */
-final class InMemoryHeatStateStore(init: HeatState) extends HeatStateStore {
-  private[this] var v: HeatState = init
-  override def get(): HeatState = v
-  override def update(s: HeatState): Unit = { v = s }
-}
 
 object HeatProcessor {
   val InitialState: HeatState = HeatState(
     p = 0.0, m = 0.0, lastTs = 0L, lastEventId = (-1L), spreeStreak = 0, level = 0, items_str = "",
-    kills = 0, deaths = 0, assists = 0, creepScore = 0.0, invValue = 0.0, championName = ""
+    kills = 0, deaths = 0, assists = 0, creepScore = 0.0, invValue = 0.0, championName = "", isDead = false
   )
 
   // ----- POWER (simple: level + inventory value) -----
@@ -113,29 +16,32 @@ object HeatProcessor {
   val ItemBudget = 16500.0 // late game high-end inventory appears to be worth about this much
 
   // ----- MOMENTUM (leaky bucket) -----
-  val HalfLifeSeconds = 45.0
-  val MomentumCap = 130.0
-  val AssistFactor = 0.7
-  val SpreeStep = 2.0 // +2 per kill in current life
-  val SpreeCap = 16.0 // cap of spree bonus
+  val HalfLifeSeconds = 40.0 // was 45.0  → fades faster (snappier, less “sticky”)
+  val MomentumCap = 70.0 // was 130.0 → every pulse counts more after normalization
+  val AssistFactor = 0.9 // was 0.70  → objectives share more momentum with teammates
+  val SpreeStep = 3.0 // was 2.0   → kill streaks ramp a bit faster
+  val SpreeCap = 15.0 // was 16.0  → tiny trim to avoid runaway
 
-  // Base pulse weights
-  val W_Kill = 14.0
-  val W_Assist = 8.0
-  val W_Death = -6.0
-  val W_FirstBlood = 6.0
-  val W_Dragon = 16.0
-  val W_Baron = 22.0
-  val W_Herald = 10.0
-  val W_Turret = 9.0
+  // Base pulse weights (↑ ~20–25% across the board)
+  val W_Kill = 18.0 // was 14.0
+  val W_Assist = 11.0 // was 8.0
+  val W_Death = -6.0 // unchanged (keeps “cool down” on deaths)
+  val W_FirstBlood = 8.0 // was 6.0
+  val W_Dragon = 22.0 // was 16.0
+  val W_Baron = 28.0 // was 22.0
+  val W_Herald = 13.0 // was 10.0
+  val W_Turret = 11.0 // was 9.0
 
-  val HeatWPower = 0.45
-  val HeatWMomentum = 0.55
+  // Heat blend - power and momentum contribute the same
+  val HeatWPower = 0.5
+  val HeatWMomentum = 0.5
 
   val momHLms = HalfLifeSeconds * 1000.0
 }
 
-class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None)
+class HeatProcessor(ttl: TTLConfig,
+                    injectedStore: Option[HeatStateStore] = None,
+                    nowFn: () => Long = () => System.currentTimeMillis())
   extends StatefulProcessor[String, HeatIn, HeatOut] {
 
   import HeatProcessor._
@@ -166,12 +72,11 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
 
   private def splitKey(k: String): (String, String, String) = {
     val parts = k.split("\\|", 3)
-    if (parts.length == 3) (parts(0), parts(1), parts(2)) else (k, "", "")
+    if (parts.length == 3) (parts(0), parts(1), parts(2))
+    else throw new IllegalStateException(s"Could not extract parts from $k")
   }
 
-  private[heat] case class StepFlags(changedSnapshot: Boolean, changedPulse: Boolean)
-
-  private[heat] def step(st: HeatState, heatIn: HeatIn): (HeatState, StepFlags) = {
+  private[heat] def step(st: HeatState, heatIn: HeatIn): HeatState = {
     val kind = heatIn.kind
     val ts = heatIn.tsMillis
     val dt = math.max(0L, ts - st.lastTs)
@@ -187,25 +92,24 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
         var bonus = 0.0
 
         if (eventId.nonEmpty && eventId.get <= st.lastEventId)
-          return (st.copy(
+          return st.copy(
             m = mDec,
-            lastTs = math.max(st.lastTs, ts)),
-            StepFlags(changedSnapshot = false, changedPulse = false)
-          )
+            lastTs = math.max(st.lastTs, ts))
+
 
         val base = (etype, role) match {
           case (Some("ChampionKill"), Some("killer")) => W_Kill
-          case (Some("ChampionKill"), Some("assist")) => W_Assist
+          case (Some("ChampionKill"), Some("assister")) => W_Assist
           case (Some("ChampionKill"), Some("victim")) => W_Death
           case (Some("FirstBlood"), Some("killer")) => W_FirstBlood
           case (Some("DragonKill"), Some("killer")) => W_Dragon
-          case (Some("DragonKill"), Some("assist")) => AssistFactor * W_Dragon
+          case (Some("DragonKill"), Some("assister")) => AssistFactor * W_Dragon
           case (Some("BaronKill"), Some("killer")) => W_Baron
-          case (Some("BaronKill"), Some("assist")) => AssistFactor * W_Baron
+          case (Some("BaronKill"), Some("assister")) => AssistFactor * W_Baron
           case (Some("HeraldKill"), Some("killer")) => W_Herald
-          case (Some("HeraldKill"), Some("assist")) => AssistFactor * W_Herald
+          case (Some("HeraldKill"), Some("assister")) => AssistFactor * W_Herald
           case (Some("TurretKilled"), Some("killer")) => W_Turret
-          case (Some("TurretKilled"), Some("assist")) => AssistFactor * W_Turret
+          case (Some("TurretKilled"), Some("assister")) => AssistFactor * W_Turret
           case _ => 0.0
         }
 
@@ -224,9 +128,9 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
 
         eventId match {
           case Some(eventId: Long) =>
-            (updatedHeatState.copy(lastEventId = eventId), StepFlags(changedSnapshot = false, changedPulse = true))
+            updatedHeatState.copy(lastEventId = eventId)
           case None =>
-            (updatedHeatState, StepFlags(changedSnapshot = false, changedPulse = true))
+            updatedHeatState
         }
 
       case "snapshot" =>
@@ -257,7 +161,6 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
         // avoid regressing items with an older-timestamp snapshot
         val acceptItems = heatIn.tsMillis >= st.lastTs
         val itemsNew = if (acceptItems) itemsInOpt.getOrElse(st.items_str) else st.items_str
-        val itemsChanged = acceptItems && itemsInOpt.exists(_ != st.items_str)
 
         // compute power FROM MERGED STATE
         val pNew = powerFrom(Some(levelNew), Some(invNew))
@@ -269,41 +172,29 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
           invValue = invNew,
           kills = kNew, deaths = dNew, assists = aNew,
           creepScore = csNew, championName = champNew,
+          isDead = heatIn.isDead.getOrElse(st.isDead),
           items_str = itemsNew,
           lastTs = math.max(st.lastTs, heatIn.tsMillis)
         )
 
-        // change detection
-        val levelChanged = levelNew > st.level
-        val pChanged = math.abs(pNew - st.p) > 1e-6
-        val kChanged = kNew > st.kills
-        val dChanged = dNew > st.deaths
-        val aChanged = aNew > st.assists
-        val csChanged = csNew > st.creepScore
-        val invChanged = invNew > st.invValue
-        val champChanged = st.championName.isEmpty && champNew.nonEmpty
-
-        val snapshotChanged =
-          levelChanged || pChanged || kChanged || dChanged || aChanged ||
-            csChanged || invChanged || champChanged || itemsChanged
-
-        (st2, StepFlags(changedSnapshot = snapshotChanged, changedPulse = false))
+        st2
     }
   }
 
   private def singleHeatOut(key: String, st: HeatState): HeatOut = {
+    val emitTsMs = nowFn()
+    val dtToNow = math.max(0L, emitTsMs - st.lastTs)
+    val mAtNow = decay(st.m, momHLms, dtToNow)
+
     // identity
     val (gameIdK, riotIdK, teamK) = splitKey(key)
 
     // normalization
-    val nP = math.max(0.0, math.min(100.0, st.p)) // power already on 0..100
-    val nM = math.max(0.0, math.min(100.0, 100.0 * st.m / MomentumCap))
-
-    // blended heat (clamped)
+    val nP = math.max(0.0, math.min(100.0, st.p))
+    val nM = math.max(0.0, math.min(100.0, 100.0 * mAtNow / MomentumCap))
     val heatVal = math.max(0.0, math.min(100.0, HeatWPower * nP + HeatWMomentum * nM))
 
     // provenance / latency
-    val emitTsMs = System.currentTimeMillis()
     val sourceTsMs = st.lastTs
     val backendLatencyMs = math.max(0L, emitTsMs - sourceTsMs)
 
@@ -312,11 +203,12 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
       team = teamK,
       riotId = riotIdK,
       championName = st.championName,
+      isDead = st.isDead,
 
       emitTsMs = emitTsMs,
 
       powerRaw = st.p,
-      momentumRaw = st.m,
+      momentumRaw = mAtNow,
       powerNorm = nP,
       momentumNorm = nM,
       heat = heatVal,
@@ -346,42 +238,20 @@ class HeatProcessor(ttl: TTLConfig, injectedStore: Option[HeatStateStore] = None
     )
   }
 
-  override def handleInputRows(
-                                key: String,
-                                inputRows: Iterator[HeatIn],
-                                timers: TimerValues): Iterator[HeatOut] = {
-
-    // pull current state (or default)
+  override def handleInputRows(key: String, inputRows: Iterator[HeatIn], timers: TimerValues): Iterator[HeatOut] = {
     var st = Option(store.get()).getOrElse(InitialState)
-
-    // OR-accumulate what changed across all rows in this micro-batch
-    var changedPulse = false
-    var changedSnapshot = false
-
-    // ensure per-key time order; step() uses dt = max(0, ts - lastTs)
     val rows = inputRows.toArray.sortBy(_.tsMillis)
 
+    val outs = scala.collection.mutable.ArrayBuffer[HeatOut]()
     var i = 0
     while (i < rows.length) {
-      val r = rows(i)
-
-      // --- the seam: one row -> (newState, flags) ---
-      val (st2, flags) = step(st, r)
-
-      // accumulate and advance
-      changedPulse ||= flags.changedPulse
-      changedSnapshot ||= flags.changedSnapshot
+      val st2 = step(st, rows(i))
       st = st2
-
+      outs += singleHeatOut(key, st)
       i += 1
     }
-
-    // persist final state for this key
     store.update(st)
-
-    // emit only if something material changed (pulse accepted or snapshot fields advanced)
-    if (changedPulse || changedSnapshot) Iterator(singleHeatOut(key, st))
-    else Iterator.empty
+    outs.iterator
   }
 }
 
