@@ -28,7 +28,7 @@ resources:
 #              zone_id: auto
 #            node_type_id: c-fleet.2xlarge
 #            driver_node_type_id: m4.xlarge
-            node_type_id: Standard_F4
+            node_type_id: Standard_F8 # We NEED 16 cores total
             driver_node_type_id: Standard_DS3_v2
             enable_elastic_disk: true
             single_user_name: alex.vanadio@databricks.com
